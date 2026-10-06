@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/social-preview.png" alt="MergeHub — 纯本地的 AI 代码审阅工作台" width="100%">
+
 # MergeHub
 
 **一个纯本地的 AI 代码审阅工作台**
