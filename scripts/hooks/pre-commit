@@ -1,0 +1,71 @@
+#!/bin/sh
+# MergeHubX pre-commit hook —— 提交前敏感信息扫描
+#
+# 作用：在 git commit 真正写入之前，扫描"将要提交的内容"（索引区），
+#       命中高危模式直接阻止提交；命中低危模式只告警不阻止。
+# 绕过：git commit --no-verify（仅在确认安全时使用）
+#
+# 安装（每个 clone 需执行一次）：
+#     git config core.hooksPath scripts/hooks
+#
+# 说明：本文件自身会被排除在扫描之外，否则它自己的规则文本会触发误报。
+
+set -u
+
+EXCLUDE=':(exclude)scripts/hooks'
+fail=0
+warn=0
+
+echo "[pre-commit] 扫描即将提交的内容..."
+
+# ---------- 1. 高危：已知密钥 / 令牌前缀、私钥块 ----------
+PAT_KEY='sk-[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{15,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|LTAI[0-9A-Za-z]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+hits=$(git grep --cached -n -I -E "$PAT_KEY" -- . "$EXCLUDE" 2>/dev/null)
+if [ -n "$hits" ]; then
+    echo "[pre-commit] 阻止：发现疑似密钥 / 私钥 / 令牌"
+    echo "$hits" | sed 's/^/    /'
+    fail=1
+fi
+
+# ---------- 2. 高危：不应提交的文件名 ----------
+staged=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+for f in $staged; do
+    case "$f" in
+        .env.example|.env.sample|.env.template)
+            ;;
+        .env|.env.*|*.pem|*.key|*.p12|*.pfx|*.keystore|id_rsa*|id_ed25519*|.netrc)
+            echo "[pre-commit] 阻止：不应提交的文件 $f"
+            fail=1
+            ;;
+    esac
+done
+
+# ---------- 3. 告警：敏感变量名 + 长字面量赋值 ----------
+PAT_ASSIGN='(password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret)[[:space:]]*[:=][[:space:]]*"[A-Za-z0-9_./+=-]{20,}"'
+hits=$(git grep --cached -n -I -E "$PAT_ASSIGN" -- . "$EXCLUDE" 2>/dev/null)
+if [ -n "$hits" ]; then
+    echo "[pre-commit] 告警：疑似硬编码凭证，请人工确认"
+    echo "$hits" | sed 's/^/    /'
+    warn=1
+fi
+
+# ---------- 4. 告警：本机绝对路径泄漏 ----------
+PAT_PATH='[A-Za-z]:[\\/]{1,2}Users|/Users/[A-Za-z0-9]|/home/[A-Za-z0-9]'
+hits=$(git grep --cached -n -I -E "$PAT_PATH" -- . "$EXCLUDE" 2>/dev/null)
+if [ -n "$hits" ]; then
+    echo "[pre-commit] 告警：疑似本机绝对路径"
+    echo "$hits" | sed 's/^/    /'
+    warn=1
+fi
+
+echo
+if [ "$fail" -ne 0 ]; then
+    echo "[pre-commit] 提交已阻止。请移除上述内容后重试，或确认安全后用 --no-verify 绕过。"
+    exit 1
+fi
+if [ "$warn" -ne 0 ]; then
+    echo "[pre-commit] 通过（有告警，请人工确认）。"
+else
+    echo "[pre-commit] 通过，未发现敏感信息。"
+fi
+exit 0
