@@ -106,19 +106,26 @@ npm run tauri build
 
 ## 🏗️ 技术架构
 
-前端 **Vue 3 + TypeScript（strict）+ Pinia + Ant Design Vue**，桌面壳 **Tauri 2**。分层单向依赖，视图层不直接调用 Tauri 命令：
+前端 **Vue 3 + TypeScript（strict）+ Pinia + Ant Design Vue**，桌面壳 **Tauri 2**。分层单向依赖：**自定义命令（`invoke`）只出现在 `services/` 层**，视图与组件不直接 `invoke`；仅有少量 UI 级插件 API（打开外部链接 `plugin-opener`、系统文件对话框 `plugin-dialog`）在视图内直接使用。
 
 ```
 src/
-├── views/          # DashboardView 总览 / ReviewView 审阅 / GovernanceView 治理
+├── main.ts         # 入口：挂载 Vue，注册 Pinia / 路由 / Ant Design Vue
+├── App.vue         # 根组件
+├── vite-env.d.ts   # Vite 环境类型声明
+├── views/          # DashboardView 总览、ReviewView 审阅（内含 RemoteReviewView
+│                   #   远程 / LocalReviewView 本地双视图）、GovernanceView 治理
+├── layouts/        # MainLayout：侧边导航 + 内容区骨架
 ├── components/
-│   ├── review/     # AI 报告面板、Diff 卡片、评审模式弹窗、提交按钮
-│   ├── governance/ # 规则集、豁免记录
-│   └── settings/   # 设置面板：平台账号 / AI 模型 / 本地 git / 调试日志
+│   ├── review/     # AiReportPanel 报告面板、DiffFileCard Diff 卡片、
+│   │               #   ReviewModeModal 评审模式弹窗、CommitButton 提交按钮
+│   ├── governance/ # RuleSets 规则集、GovernanceRecords 豁免记录
+│   └── settings/   # SettingsPanel 设置面板：PlatformAccounts 平台账号、
+│                   #   AiModels AI 模型、LocalGitPrefs 本地 git、AiDebugLog 调试日志
 ├── composables/    # useAiReviewFlow 评审流程状态机、useReviewExport 导出、useReviewGroup 分组
 ├── stores/         # Pinia：settings / prs / watchlist / localRepos / localReview /
 │                   #         ai / reviewRules / governanceIssues / ui
-├── services/
+├── services/       # 自定义命令（invoke）只出现在这一层
 │   ├── ai/         # 评审引擎：engine 编排、batching 分块、client 调用、
 │   │               #           prompts 提示词、verify 复核、merge 历史对比、
 │   │               #           governance 规则归纳、commit 提交信息、errors 错误友好化
@@ -129,16 +136,20 @@ src/
 │   ├── storage.ts  # localStorage 持久化
 │   └── aiDebugLog.ts
 ├── types/          # ai / local / platform 类型定义
-├── utils/          # 无依赖纯工具（问题指纹：跨层共用的精确匹配键）
+├── utils/          # 无依赖纯工具（issueFingerprint 问题指纹：跨层共用的精确匹配键）
 ├── router/         # 路由（hash history）
-└── styles/
+└── styles/         # main.css 全局样式、review-shared.css 评审共用样式
 
 src-tauri/src/
-├── commands.rs     # HTTP 代理（流式 / 取消）、系统凭据、AI 日志
-├── git.rs          # 本地 git：diff / commit / branches / checkout
-├── lib.rs          # 应用装配、WebView 数据目录
-└── main.rs
+├── commands.rs     # 9 个命令：HTTP 代理（请求 / 流式 / 取消）、系统凭据（set / get / delete）、
+│                   #   AI 日志追加与日志目录打开、本地文件夹打开
+├── git.rs          # 8 个命令：仓库信息、diff、commit、分支列表、切换分支、
+│                   #   push、remote 列表、读取工作区文件
+├── lib.rs          # 应用装配、注册全部 17 个命令、WebView 数据目录
+└── main.rs         # 二进制入口
 ```
+
+> 单元测试以 `__tests__/` 就近放在各层（`services/`、`stores/`、`utils/`），与对应模块一起演进；运行方式见上方「单元测试」。
 
 ## 📂 数据存储位置
 
