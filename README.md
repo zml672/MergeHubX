@@ -63,6 +63,17 @@ npm run tauri dev
 
 > 只想调试前端页面可以 `npm run dev`，但 Tauri 命令不可用，功能不完整。
 
+### 提交前检查（pre-commit）
+
+仓库自带一个 pre-commit 钩子，提交前会扫描密钥、令牌、私钥与泄漏的本机绝对路径。
+克隆后执行一次即可启用：
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
+命中高危内容会直接阻止提交；确认安全时可用 `git commit --no-verify` 绕过。
+
 ### 构建发布
 
 ```bash
