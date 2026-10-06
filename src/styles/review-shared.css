@@ -1,0 +1,384 @@
+/* 远程/本地评审子视图共用的页面级样式（review-page 布局、侧栏仓库卡片、详情头、回到顶部等）。
+   由 RemoteReviewView / LocalReviewView 各自 import（幂等），注意本文件是全局样式：
+   - 原 scoped 的 :deep(...) 已改写为等价后代选择器（antd 内部类，全局匹配无副作用）
+   - fade 过渡动画留在各视图的 scoped 样式内 */
+
+.review-page {
+  height: 100%;
+  display: flex;
+  overflow: hidden;
+  background: #fff;
+}
+
+.review-aside {
+  width: 320px;
+  flex-shrink: 0;
+  border-right: 1px solid #f0f0f0;
+  background: #fafafa;
+  display: flex;
+  flex-direction: column;
+}
+
+.aside-toolbar {
+  height: 48px;
+  padding: 0 10px 0 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #f0f0f0;
+  flex-shrink: 0;
+}
+
+.aside-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.85);
+}
+
+.add-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #595959;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s, transform 0.1s;
+}
+
+.add-btn:hover {
+  background: #e6f4ff;
+  color: #1677ff;
+}
+
+.add-btn:active {
+  transform: scale(0.94);
+}
+
+.add-btn:focus-visible {
+  outline: 2px solid #1677ff;
+  outline-offset: -2px;
+}
+
+.aside-segments {
+  padding: 12px 12px 0;
+  flex-shrink: 0;
+}
+
+.aside-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.aside-empty {
+  padding: 16px 0;
+}
+
+.repo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.repo-card {
+  background: #fff;
+  border: 1px solid #ececec;
+  border-radius: 10px;
+  transition: border-color 0.15s cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 0.15s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.repo-card:hover {
+  border-color: #d9d9d9;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+}
+
+.repo-card.open {
+  border-color: #c6d9f5;
+}
+
+.repo-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 10px 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.repo-head:focus-visible {
+  outline: 2px solid #1677ff;
+  outline-offset: -2px;
+}
+
+.repo-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.88);
+}
+
+.repo-count {
+  flex-shrink: 0;
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #f5f5f5;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+  color: rgba(0, 0, 0, 0.65);
+  font-variant-numeric: tabular-nums;
+}
+
+.repo-chevron {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: #bfbfbf;
+  transition: transform 0.2s cubic-bezier(0.2, 0, 0, 1), opacity 0.15s;
+}
+
+.repo-card.open .repo-chevron {
+  transform: rotate(90deg);
+}
+
+.repo-head:hover .repo-chevron {
+  opacity: 0;
+}
+
+.repo-actions {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  display: flex;
+  gap: 2px;
+  padding-left: 32px;
+  background: linear-gradient(to right, rgba(255, 255, 255, 0), #fff 24px);
+  border-radius: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+
+.repo-head:hover .repo-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.repo-action {
+  flex-shrink: 0;
+}
+
+.repo-card.selected {
+  border-color: #1677ff;
+  background: #f0f7ff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pr-collapse,
+  .repo-chevron,
+  .repo-actions,
+  .add-btn,
+  .repo-card,
+  .pr-item {
+    transition: none;
+  }
+}
+
+.aside-footer {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  border-top: 1px solid #f0f0f0;
+  font-size: 12px;
+  color: #8c8c8c;
+}
+
+.review-main {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.review-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.empty-hint {
+  font-size: 12px;
+  color: #8c8c8c;
+}
+
+.detail-header {
+  padding: 14px 24px;
+  border-bottom: 1px solid #f0f0f0;
+  flex-shrink: 0;
+}
+
+.detail-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.detail-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-no {
+  color: #8c8c8c;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.detail-meta {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.65);
+}
+
+.meta-branches {
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  background: #f5f5f5;
+  padding: 1px 8px;
+  border-radius: 4px;
+}
+
+.meta-branch-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: rgba(0, 0, 0, 0.65);
+}
+
+.branch-select {
+  min-width: 150px;
+}
+
+.branch-select .ant-select-selector {
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.meta-sep {
+  color: #d9d9d9;
+}
+
+.detail-stats {
+  margin-left: auto;
+  display: flex;
+  gap: 10px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 12px;
+}
+
+.stat-add {
+  color: #52c41a;
+}
+
+.stat-del {
+  color: #ff4d4f;
+}
+
+.stat-files {
+  color: rgba(0, 0, 0, 0.65);
+}
+
+.detail-actions {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.detail-actions-left,
+.detail-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-body {
+  flex: 1;
+  overflow: auto;
+  /* 顶部不留 padding：吸附带的 12px 间距由标签栏自身的内边距承担（不透明），
+     否则滚动内容会从容器的顶部 padding 缝隙中透出 */
+  padding: 0 24px 24px;
+  background: #f5f5f5;
+}
+
+/* Tab 标题栏（变更文件/描述/AI 评审）吸附在详情区顶部，切换 Tab 时无需先滚回顶部 */
+.detail-body .ant-tabs > .ant-tabs-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  /* 上下内边距随标签栏一起吸附，吸附带整体不透明，滚动内容无法透出 */
+  padding-top: 12px;
+  margin-bottom: 0;
+  padding-bottom: 16px;
+  background: #f5f5f5;
+}
+
+/* 浮动“回到顶部”按钮：悬浮于详情区右下角，不随内容滚动。
+   位置需避开 MainLayout 的右下角快捷工具坞（fixed，bottom: 20px，高约 93px，
+   顶边约 113px）：bottom 125px = 工具坞顶边 + 12px 间距；
+   right 24px 使按钮与工具坞按钮水平居中对齐 */
+.back-top {
+  position: absolute;
+  right: 24px;
+  bottom: 125px;
+  z-index: 20;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  color: rgba(0, 0, 0, 0.65);
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 4px;
+  cursor: pointer;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.15);
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.back-top:hover {
+  color: #1677ff;
+  border-color: #1677ff;
+}
+
+.diff-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
