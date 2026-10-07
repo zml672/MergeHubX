@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tagName:
+        description: '要发布的 tag（如 v0.1.0），留空则仅构建不发布'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-release
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tagName || github.ref_name }}
+          releaseName: ${{ github.event_name == 'workflow_dispatch' && inputs.tagName || github.ref_name }}
+          releaseBody: |
+            桌面端安装包见下方 Assets。
+
+            - `*-setup.exe` — NSIS 安装包（**普通用户下载这个**）
+            - `*.msi` — WiX 安装包（适合企业批量部署）
+
+            完整说明见 [README](https://github.com/${{ github.repository }}#readme)。
+          releaseDraft: true
+          prerelease: false
+          args: ''
