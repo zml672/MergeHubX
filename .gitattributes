@@ -1,0 +1,45 @@
+# 换行符与文件类型规则（本文件随仓库分发，优先级高于各机器的 core.autocrlf 配置）
+# 目标：仓库内文本统一 LF；二进制文件禁止任何转换；跨工具/跨平台同步不再产生换行符噪音 diff
+
+# 默认：文本文件入库时归一化为 LF，检出时按各平台配置转换
+* text=auto
+
+# ---- 源码与文本配置：强制 LF（无论在哪个平台检出都保持 LF，行为完全一致）----
+*.rs   text eol=lf
+*.toml text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.vue  text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.css  text eol=lf
+*.scss text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# ---- Shell 脚本：必须 LF（bash 解析 CRLF 会报 '\r': command not found）----
+*.sh                     text eol=lf
+scripts/hooks/pre-commit text eol=lf
+
+# ---- Windows 批处理：必须 CRLF（cmd 解释器要求）----
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# ---- 二进制文件：明确声明，禁止换行转换与文本 diff ----
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.icns binary
+*.woff  binary
+*.woff2 binary
+*.ttf  binary
+*.eot  binary
+*.exe  binary
+*.msi  binary
+*.dll  binary
