@@ -509,13 +509,17 @@ function openResediment(id: string) {
   openSediment()
 }
 
-/** 作废当前提炼会话：递增序号使旧回调失效，并置位取消句柄、通知 Rust 中止流（弹窗关闭与组件卸载共用） */
+/** 作废当前提炼会话：递增序号使旧回调失效，并置位取消句柄、逐条取消在途流（弹窗关闭与组件卸载共用）。
+ *  每条流有独立线束 id（client.ts 发流时登记进 streamIds），须逐个通知 Rust 中止——单 id 取消只能命中最后注册的那条流 */
 function invalidateSedimentSession() {
   sedimentSession += 1
   const cancel = activeSedimentCancel
   if (cancel && !cancel.cancelled) {
     cancel.cancelled = true
-    void httpStreamCancel(cancel.requestId).catch(() => {})
+    const ids = cancel.streamIds ?? [cancel.requestId]
+    for (const id of ids) {
+      void httpStreamCancel(id).catch(() => {})
+    }
   }
   activeSedimentCancel = null
 }
@@ -552,9 +556,11 @@ async function runSummarize() {
     return
   }
   const session = ++sedimentSession
+  // streamIds：在途流线束 id 集合（client.ts 登记注销），作废会话时逐条取消（对齐评审停止的同构修复）
   const cancel: ReviewCancelHandle = {
     requestId: `sediment_${Date.now().toString(36)}`,
     cancelled: false,
+    streamIds: new Set(),
   }
   activeSedimentCancel = cancel
   summarizing.value = true

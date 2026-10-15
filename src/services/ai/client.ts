@@ -30,6 +30,14 @@ export interface ReviewCancelHandle {
   requestId: string
   /** 由 store 在用户点停止时置位；请求失败/退避期间无法走 Rust token 取消，靠此标志阻断重试 */
   cancelled: boolean
+  /**
+   * 在途流式请求的 Rust 注册表 id 集合（线束 id = requestId#流序号，client.ts 发流时登记、settle 时移除）。
+   * 停止入口必须逐个取消集合内的 id：Rust 注册表按 id 一对一存取消 token，多条流共享同一 id 会
+   * 后到覆盖（只有最后注册的可取消）、先完成的流 Drop 守卫会误删在途流的注册——停止按钮就会「点了没反应」
+   */
+  streamIds?: Set<string>
+  /** 线束 id 自增序号（client.ts 内部维护） */
+  streamSeq?: number
 }
 
 export class ReviewCancelledError extends Error {
@@ -219,6 +227,13 @@ export async function chatCompletionStream(
   // 连接 10s、空闲 90s（连续无新数据即中断，错误含「超时」字样命中重试白名单）、总时长 600s。
   // 流式不适用非流式的固定 CHAT_TIMEOUT_SECS——健康的长时间生成合法超过 120 秒，
   // 流式语义是「空闲 + 总时长」双上限而非固定总时长；因此 JS 侧 Promise 必然 settle，不会永久挂起
+  // 线束 id：同一 cancel 句柄可能并发承载多条流（多批次评审 / 复核 worker 池 / 格式重试），
+  // 每条流用独立 id 在 Rust 注册表登记（一对一对一取消），settle 后立即注销；
+  // 共享同一个 id 会被后注册覆盖、且先结束流的守卫会误删在途流的注册——停止按钮将失效
+  // 序号自增是副作用，独立成句避免藏在模板拼接里（JS 无前置自增，先取后存需两步）
+  const seq = cancel ? (cancel.streamSeq = (cancel.streamSeq ?? 0) + 1) : 0
+  const streamId = `${cancel?.requestId ?? 'anon'}#${seq}`
+  if (cancel?.streamIds) cancel.streamIds.add(streamId)
   const res = await httpStreamRequest(
     {
       url: endpointOf(config.baseUrl),
@@ -233,11 +248,16 @@ export async function chatCompletionStream(
       }),
     },
     consume,
-    cancel?.requestId,
-  ).catch((err: unknown) => {
-    if (err === STREAM_CANCELLED_MARKER) throw new ReviewCancelledError()
-    throw err
-  })
+    cancel ? streamId : undefined,
+  )
+    .catch((err: unknown) => {
+      if (err === STREAM_CANCELLED_MARKER) throw new ReviewCancelledError()
+      throw err
+    })
+    .finally(() => {
+      // settle 即注销：让 Rust 侧守卫删除的是本条流自己的注册，不牵连其他在途流
+      if (cancel?.streamIds) cancel.streamIds.delete(streamId)
+    })
   // 流结束冲刷残留 buffer：非规范服务器/代理截断下，最后一个 data 事件可能不带换行符，
   // 不冲刷会静默丢失末段增量内容与最终 usage 统计
   if (buffer) {

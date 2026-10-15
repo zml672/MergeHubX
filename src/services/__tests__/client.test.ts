@@ -103,6 +103,77 @@ describe('chatCompletionStream SSE 解析', () => {
   })
 })
 
+describe('线束 id：取消注册表一对一映射（停止按钮可靠性的根基）', () => {
+  const sseOk = `${sse({ choices: [{ delta: { content: 'ok' } }] })}\n`
+
+  it('cancel 句柄携带 streamIds 时：发流登记独立线束 id，settle 后注销', async () => {
+    const seenIds: (string | undefined)[] = []
+    vi.mocked(httpStreamRequest).mockImplementation(async (_o, onChunk, requestId) => {
+      seenIds.push(requestId)
+      onChunk(sseOk)
+      return { status: 200, headers: {}, body: null }
+    })
+    const cancel = { requestId: 'req_A', cancelled: false, streamIds: new Set<string>() }
+    await chatCompletionStream(config, [{ role: 'user', content: 'hi' }], undefined, cancel)
+    expect(seenIds[0]).toMatch(/^req_A#\d+$/)
+    expect(cancel.streamIds.size).toBe(0)
+  })
+
+  it('同一句柄并发多条流：线束 id 互不相同（Rust 注册表后到覆盖的根治依据）', async () => {
+    const seenIds: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    vi.mocked(httpStreamRequest).mockImplementation(async (_o, onChunk, requestId) => {
+      seenIds.push(requestId as string)
+      if (seenIds.length === 2) release()
+      await gate
+      onChunk(sseOk)
+      return { status: 200, headers: {}, body: null }
+    })
+    const cancel = { requestId: 'req_B', cancelled: false, streamIds: new Set<string>() }
+    await Promise.all([
+      chatCompletionStream(config, [{ role: 'user', content: '1' }], undefined, cancel),
+      chatCompletionStream(config, [{ role: 'user', content: '2' }], undefined, cancel),
+    ])
+    expect(seenIds.length).toBe(2)
+    expect(new Set(seenIds).size).toBe(2)
+  })
+
+  it('无线束集合的句柄（旧调用方）退化为按 requestId 前缀注册，不抛错', async () => {
+    const seenIds: (string | undefined)[] = []
+    vi.mocked(httpStreamRequest).mockImplementation(async (_o, onChunk, requestId) => {
+      seenIds.push(requestId)
+      onChunk(sseOk)
+      return { status: 200, headers: {}, body: null }
+    })
+    const cancel = { requestId: 'req_C', cancelled: false }
+    await chatCompletionStream(config, [{ role: 'user', content: 'hi' }], undefined, cancel)
+    expect(seenIds[0]).toMatch(/^req_C#\d+$/)
+  })
+
+  it('取消句柄缺省（如测试连接）时不传线束 id', async () => {
+    const seenIds: (string | undefined)[] = []
+    vi.mocked(httpStreamRequest).mockImplementation(async (_o, onChunk, requestId) => {
+      seenIds.push(requestId)
+      onChunk(sseOk)
+      return { status: 200, headers: {}, body: null }
+    })
+    await chatCompletionStream(config, [{ role: 'user', content: 'hi' }])
+    expect(seenIds[0]).toBeUndefined()
+  })
+
+  it('流抛错（含用户取消）路径同样注销线束 id（finally 语义）', async () => {
+    vi.mocked(httpStreamRequest).mockRejectedValue(new Error('HTTP_STREAM_CANCELLED'))
+    const cancel = { requestId: 'req_D', cancelled: false, streamIds: new Set<string>() }
+    await expect(
+      chatCompletionStream(config, [{ role: 'user', content: 'hi' }], undefined, cancel),
+    ).rejects.toThrow()
+    expect(cancel.streamIds.size).toBe(0)
+  })
+})
+
 describe('effectiveConcurrency', () => {
   it('正常配置直接生效并受上限约束', () => {
     expect(effectiveConcurrency({ ...config, concurrency: 3 }, 10)).toBe(3)

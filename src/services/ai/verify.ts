@@ -4,6 +4,7 @@ import { chatCompletionStream, effectiveConcurrency, mergeUsage, ReviewCancelled
 import type { ChatMessage, ReviewCancelHandle, TokenUsage } from './client'
 import { sanitizeInline } from './prompts'
 import { dedupeAndSortIssues, extractJsonBlock } from './merge'
+import type { ContentCache, OversizedFileSet } from './locate'
 import type { AiReviewListener } from './engine'
 import { logAiRequest, logAiAnswer, logAiError } from '../aiDebugLog'
 import type { AiIssue, AiModelConfig, AiReviewResult } from '../../types/ai'
@@ -11,8 +12,10 @@ import type { AiIssue, AiModelConfig, AiReviewResult } from '../../types/ai'
 /** 文件全文读取器：第二遍对抗式复核的取证通道；失败时抛错，由调用方按“跳过该文件复核”容错 */
 export type FileContentFetcher = (path: string) => Promise<string>
 
-/** 第二遍复核的单文件全文上限：超出则跳过该文件复核，保留第一遍结论 */
-const VERIFY_FILE_SIZE_LIMIT = 160 * 1024
+/** 单文件全文上限：取文尺寸的唯一口径（复核与行号重定位共用，locate.ts 从此处导入）——
+ *  两阶段共享同一 ContentCache 与同一条取文通道，上限必须单源定义；
+ *  各自独立定义会导致缓存回填与降级判定悄然分叉（locate 认可、verify 拒收或反之） */
+export const VERIFY_FILE_SIZE_LIMIT = 160 * 1024
 
 /** 复核数据围栏定界符：罕见字符串，包裹不可信数据（仓库代码与问题清单），配合 system 不可信声明防御代码中嵌入的伪造指令操纵复核模型 */
 const VERIFY_DATA_FENCE_BEGIN = '<<<MHUB_VERIFY_DATA_BEGIN>>>'
@@ -176,6 +179,8 @@ async function verifyIssues(
   logDir: string,
   changedFiles: Set<string>,
   fetchFileContent?: FileContentFetcher,
+  contentCache?: ContentCache,
+  oversizedFiles?: OversizedFileSet,
 ): Promise<
   | {
       stat: NonNullable<AiReviewResult['verify']>
@@ -207,7 +212,12 @@ async function verifyIssues(
     // 取证阶段取消与模型调用阶段保持一致：抛 ReviewCancelledError 由上游统一处理，禁止静默返回导致评审照常触发 done
     if (cancel?.cancelled) throw new ReviewCancelledError()
     try {
-      const content = await fetchFileContent(path)
+      // 重定位阶段已确认超限的文件免拉取直接跳过：该文件定位阶段已完整传输过一次，
+      // 再拉一次只会拿到同样的超限内容后丢弃，纯浪费
+      if (oversizedFiles?.has(path)) continue
+      // 重定位阶段已取过全文的文件直接复用缓存，避免同批文件重复拉取
+      let content = contentCache?.get(path)
+      if (content === undefined) content = await fetchFileContent(path)
       if (!content || content.length > VERIFY_FILE_SIZE_LIMIT) continue
       prepared.push({ path, content, issues })
     } catch {

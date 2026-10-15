@@ -262,4 +262,47 @@ describe('verifyIssues 统计口径', () => {
     expect(outcome!.stat.failedFiles).toBe(1)
     expect(outcome!.stat).toMatchObject({ confirmed: 1, filtered: 0, unverified: 1 })
   })
+
+  it('超限哨兵命中：重定位已确认超限的文件免拉取直接跳过（免大文件二次传输）', async () => {
+    const fetched: string[] = []
+    const outcome = await verifyIssues(
+      config,
+      [resultWith([issue({ file: 'big.ts', line: 1, comment: '甲' })])],
+      undefined,
+      undefined,
+      'log',
+      new Set(['big.ts']),
+      async (p) => {
+        fetched.push(p)
+        return 'code'
+      },
+      undefined,
+      new Set(['big.ts']),
+    )
+    // 命中哨兵：不再发起取文（重定位阶段已完整传输过一次，再拉只会拿到同样超限内容后丢弃）
+    expect(fetched).toEqual([])
+    expect(chatCompletionStream).not.toHaveBeenCalled()
+    expect(outcome).toBeUndefined()
+  })
+
+  it('未传超限哨兵：向后兼容，超限文件自行取文后发现超限丢弃（保留第一遍结论）', async () => {
+    const big = 'x'.repeat(160 * 1024 + 1)
+    const fetched: string[] = []
+    const outcome = await verifyIssues(
+      config,
+      [resultWith([issue({ file: 'big.ts', line: 1, comment: '甲' })])],
+      undefined,
+      undefined,
+      'log',
+      new Set(['big.ts']),
+      async (p) => {
+        fetched.push(p)
+        return big
+      },
+    )
+    // 无哨兵时保持旧逻辑：拉取后发现超限跳过
+    expect(fetched).toEqual(['big.ts'])
+    expect(outcome).toBeUndefined()
+    expect(chatCompletionStream).not.toHaveBeenCalled()
+  })
 })

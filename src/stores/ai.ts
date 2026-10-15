@@ -438,8 +438,18 @@ export const useAiStore = defineStore('ai', {
     stopReview(key: string) {
       const handle = activeStreamIds.get(key)
       if (!handle) return
+      // 标志位先置位：阻断重试/退避路径上尚未发起的后续流（此时 Rust 侧无注册可取消）
       handle.cancelled = true
-      void httpStreamCancel(handle.requestId).catch(() => undefined)
+      // 逐条取消在途流：每条流有独立线束 id（client.ts 发流时登记），Rust 注册表按 id 一对一取 token
+      const streamIds = handle.streamIds
+      if (streamIds) {
+        for (const id of streamIds) {
+          void httpStreamCancel(id).catch(() => undefined)
+        }
+      } else {
+        // 兜底：旧句柄无线束集合（理论上不存在），退回按基础 id 取消
+        void httpStreamCancel(handle.requestId).catch(() => undefined)
+      }
     },
     applyReviewEvent(key: string, event: AiReviewEvent) {
       const log = this.reviewLogs[key]
@@ -550,6 +560,32 @@ export const useAiStore = defineStore('ai', {
               schedulePersistResumePoints(this.resumePoints)
             }
           }
+          persistLogs(this.reviewLogs)
+          break
+        }
+        case 'relocateDone': {
+          const { confirmed, relocated, unlocatable, failedFiles } = event.stat
+          const parts: string[] = []
+          if (confirmed > 0) parts.push(`确认 ${confirmed} 条坐标可信`)
+          if (relocated > 0) parts.push(`修正 ${relocated} 条越界行号`)
+          if (unlocatable > 0) parts.push(`${unlocatable} 条无法取证`)
+          const detail =
+            parts.length > 0
+              ? `${parts.join('，')}；坐标可信后再进入全文复核`
+              : // parts 为空只发生在零意见时（有意见必然至少落一态）：并非「有问题无需修正」，而是本轮根本没报出意见
+                '本轮评审未报出意见，无行号可重定位'
+          log.steps.push({
+            key: 'relocate',
+            title: '行号重定位完成',
+            // 重定位不阻断主流程：取证失败只是部分意见降级，步骤恒为 done（详情里体现失败数）
+            status: 'done',
+            detail:
+              failedFiles != null && failedFiles > 0
+                ? `${detail}（${failedFiles} 个文件取证失败）`
+                : detail,
+            startedAt: 0,
+            endedAt: Date.now(),
+          })
           persistLogs(this.reviewLogs)
           break
         }
@@ -670,7 +706,9 @@ export const useAiStore = defineStore('ai', {
             )
           : new Map<number, AiReviewResult>()
       const requestId = generateRequestId()
-      const cancel: ReviewCancelHandle = { requestId, cancelled: false }
+      // streamIds：在途流式请求的线束 id 集合（client.ts 发流登记/settle 注销），stopReview 逐条取消——
+      // 评审并发多条流（多批次 + 复核 + 总评）各自在 Rust 注册表有独立 token，停止按钮可全量命中
+      const cancel: ReviewCancelHandle = { requestId, cancelled: false, streamIds: new Set() }
       activeStreamIds.set(key, cancel)
       this.reviewing[key] = true
       this.reviewErrors[key] = ''

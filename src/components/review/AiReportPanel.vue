@@ -16,6 +16,7 @@ import { useReviewExport } from '../../composables/useReviewExport'
 import { friendlyAiError } from '../../services/ai'
 import { AI_ISSUE_TYPE_META, AI_RISK_META, AI_SEVERITY_META } from '../../types/ai'
 import type { AiIssue, IssueDisposition } from '../../types/ai'
+import { LOCATION_STATUS_META } from '../../services/ai/locate'
 
 const props = defineProps<{
   /** AI 评审流程状态与动作（由视图通过 useAiReviewFlow 创建） */
@@ -475,6 +476,14 @@ function confirmGovern() {
                       {{ AI_ISSUE_TYPE_META[issue.type].label }}
                     </a-tag>
                     <a-tag v-if="recordOf(issue)?.disposition === 'comply'" color="blue">遵守</a-tag>
+                    <!-- 历史持久化数据可能含未知 locationStatus（状态枚举演进后旧数据失配），可选链+兜底防御渲染，未知值静默不显示徽标而非崩整面板 -->
+                    <a-tag
+                      v-if="issue.locationStatus && LOCATION_STATUS_META[issue.locationStatus]?.badge"
+                      :color="LOCATION_STATUS_META[issue.locationStatus]?.color ?? 'default'"
+                      :title="LOCATION_STATUS_META[issue.locationStatus]?.tooltip(issue) ?? ''"
+                    >
+                      {{ LOCATION_STATUS_META[issue.locationStatus]?.label ?? '' }}
+                    </a-tag>
                     <a-tag v-if="issue.prevStatus === 'partial'" color="warning">上轮已报·部分修复</a-tag>
                     <a-tag v-else-if="issue.prevStatus === 'not_fixed'" color="error">上轮已报·未修复</a-tag>
                     <span

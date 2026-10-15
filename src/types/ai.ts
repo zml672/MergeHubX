@@ -88,6 +88,9 @@ export type AiIssueType =
   | 'style'
   | 'convention'
 
+/** 意见行号重定位状态：confirmed=行号经文件全文校验在范围内；relocated=行号越界已修正到文件末行；unlocatable=无法取证（文件不在变更清单/取文失败/行号无效）。借鉴 ocr（阿里 open-code-review）意见重定位：行号坐标由程序事实保证，不依赖模型自觉 */
+export type AiIssueLocationStatus = 'confirmed' | 'relocated' | 'unlocatable'
+
 export interface AiIssue {
   file: string
   line: number
@@ -98,6 +101,10 @@ export interface AiIssue {
   suggestion?: string
   /** 第二遍复核判为误报的原因（仅被过滤的问题携带，供复核摘要明细展示） */
   verifyReason?: string
+  /** 行号重定位状态：程序用文件全文对模型给的行号做范围校验后的结论。未执行重定位（旧持久化数据/未启用）时缺省 */
+  locationStatus?: AiIssueLocationStatus
+  /** 重定位前的原始行号（仅 relocated 携带，记录模型原报的越界值，供展示漂移轨迹） */
+  originalLine?: number
 }
 
 /** 上次问题的复核结论 */

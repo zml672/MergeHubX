@@ -7,6 +7,8 @@ import { buildSystemPrompt } from './prompts'
 import { mergeResults, parseReviewContent } from './merge'
 import type { BatchOutcome } from './merge'
 import { verifyIssues } from './verify'
+import { relocateIssues } from './locate'
+import type { ContentCache, OversizedFileSet, RelocateStat } from './locate'
 import type { FileContentFetcher } from './verify'
 import { localLogDir, remoteLogDir, logAiRequest, logAiAnswer, logAiError, shortHash } from '../aiDebugLog'
 import type { AiModelConfig, AiReviewResult, GovernanceRecord, ReviewRule } from '../../types/ai'
@@ -47,6 +49,7 @@ export type AiReviewEvent =
       /** 批次评审结果：随事件带回供调用方逐批持久化断点；续跑跳过的批次不触发本事件 */
       result?: AiReviewResult
     }
+  | { type: 'relocateDone'; stat: RelocateStat }
   | { type: 'verifyStart'; files: number; issues: number }
   | {
       type: 'verifyDone'
@@ -411,14 +414,36 @@ export async function reviewPullRequest(
   const firstRejected = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected')
   if (firstRejected) throw firstRejected.reason
 
+  // 行号重定位先于复核：坐标程序化校验/修正后，复核的证据引行才有可信基准；无取证通道时跳过（与复核同语义）。
+  // 共享内容缓存：重定位取过的全文复核直接复用，同一文件一次评审只拉一次
+  const contentCache: ContentCache = new Map()
+  // 超限文件哨兵：定位阶段取文发现超限记入，复核阶段命中免拉取直接跳过（免大文件二次传输）
+  const oversizedFiles: OversizedFileSet = new Set()
+  // 变更白名单唯一实例：重定位与复核共用同一口径（新增过滤规则只改这一处）
+  const changedPaths = new Set(pr.files.map((f) => f.path))
+  if (fetchFileContent) {
+    const relocateStat = await relocateIssues(
+      results.flatMap((r) => r.issues),
+      fetchFileContent,
+      changedPaths,
+      cancel,
+      contentCache,
+      oversizedFiles,
+    )
+    onEvent?.({ type: 'relocateDone', stat: relocateStat })
+  }
+
   const verifyOutcome = await verifyIssues(
     config,
     results,
     onEvent,
     cancel,
     logDir,
-    new Set(pr.files.map((f) => f.path)),
+    changedPaths,
     fetchFileContent,
+    // 无取证通道时不传缓存：verify 会先因 fetchFileContent 缺失自行跳过；有通道时重定位未命中的文件缓存为空，verify 按原逻辑自行取文
+    fetchFileContent ? contentCache : undefined,
+    oversizedFiles,
   )
   const merged = await mergeResults(config, results, previous, onEvent, cancel, logDir)
   if (verifyOutcome) merged.result.verify = verifyOutcome.stat
