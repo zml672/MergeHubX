@@ -66,6 +66,24 @@ export interface AiModelConfig {
   apiKey: string
   /** 批次评审并发数，默认 2；调大可缩短总耗时，但过大会触发 API 限流 */
   concurrency?: number
+  /** 思考力度（P1-16）：透传为 reasoning_effort 请求参数；缺省不发送（跟随模型默认）。
+   * 智谱 GLM-5.3 系强制思考且默认 max（评审请求常因此思考 90K+ 触顶 600 秒截断），选 low 可解；
+   * 官方仅 GLM-5.2+ 支持此参数，5.3/5.3-flash 只认 low/high/max——不支持的模型收到后由服务端忽略或报错，
+   * 故缺省不发、显式选档才透传 */
+  reasoningEffort?: ThinkingEffort
+  /** 流式总时长上限秒数（P1-16 延伸）：透传给 Rust 代理的总时长保险丝，缺省 600；
+   * 合法区间 120~3600（区间外由 JS/Rust 双侧钳制回退默认），空闲超时 90 秒固定不受此影响 */
+  streamTimeoutSecs?: number
+}
+
+/** 思考力度档位（P1-16）：与智谱 reasoning_effort 的 5.3 系合法档位对齐（low/high/max）。
+ * 档位语义：low 轻度推理（评审场景够用、耗时大降）；high 增强推理；max 深度推理（官方默认） */
+export type ThinkingEffort = 'low' | 'high' | 'max'
+
+export const THINKING_EFFORT_META: Record<ThinkingEffort, { label: string; hint: string }> = {
+  low: { label: '轻度（low）', hint: '最快，评审/复核场景够用；GLM-5.3 系推荐，可避免长思考超时' },
+  high: { label: '增强（high）', hint: '推理更充分，耗时与 token 显著增加' },
+  max: { label: '深度（max）', hint: '官方默认，深度推理；GLM-5.3 系评审场景易触发 600 秒截断' },
 }
 
 export interface AiModelProfile {
@@ -75,6 +93,33 @@ export interface AiModelProfile {
   baseUrl: string
   model: string
   concurrency?: number
+  /** 思考力度：缺省跟随模型默认（请求不携带 reasoning_effort） */
+  reasoningEffort?: ThinkingEffort
+  /** 流式总时长上限秒数：缺省 600；深度思考模型可调大（120~3600） */
+  streamTimeoutSecs?: number
+}
+
+/** 校验持久化/表单数据中的思考力度档位：枚举外脏值（手改/跨版本残留）回退 undefined（不发送） */
+export function normalizeThinkingEffort(raw: unknown): ThinkingEffort | undefined {
+  return raw === 'low' || raw === 'high' || raw === 'max' ? raw : undefined
+}
+
+/** 流式总时长上限的合法区间与默认值（P1-16 延伸）：与 client.effectiveStreamTimeoutSecs、
+ * Rust 侧钳制保持三处一致（Rust 二次钳制不信任 JS） */
+export const STREAM_TIMEOUT_RANGE = { min: 120, max: 3600, default: 600 } as const
+
+/** 校验持久化/表单数据中的流式总时长：区间外的有限整数与一切脏值回退 undefined（用默认 600） */
+export function normalizeStreamTimeoutSecs(raw: unknown): number | undefined {
+  if (
+    typeof raw === 'number' &&
+    Number.isFinite(raw) &&
+    Number.isInteger(raw) &&
+    raw >= STREAM_TIMEOUT_RANGE.min &&
+    raw <= STREAM_TIMEOUT_RANGE.max
+  ) {
+    return raw
+  }
+  return undefined
 }
 
 export type AiRiskLevel = 'low' | 'medium' | 'high'
@@ -135,6 +180,13 @@ export interface AiReviewResult {
   previousChecks?: AiPreviousCheck[]
   /** 对比基准（上次评审的 reviewedAt），无对比时缺省 */
   comparedWith?: number
+  /** 引擎层豁免前置拦截统计（P1-15②）：命中治理豁免记录的意见在复核前被移出报告主体，不再进入清单与复核（省 token）；
+   * 旧持久化结果缺省视为未执行拦截，展示层过滤仍兜底 */
+  exempted?: {
+    count: number
+    /** 被拦截意见的明细（供报告展示；跨批重复出现的问题已按 merge 同口径去重） */
+    issues: AiIssue[]
+  }
   /** 第二遍对抗式复核统计：对报过问题的文件取全文验证证据；未执行复核时缺省 */
   verify?: {
     /** 复核后模型显式确认成立的问题数（未获显式结论的不计入） */
@@ -259,8 +311,10 @@ export interface RuleSet {
 /** 治理记录：审阅侧加入豁免/遵守的 AI 评审问题，跨分析持久生效，统一在治理工作台管理与提炼 */
 export interface GovernanceRecord {
   id: string
-  /** 记录指纹：文件 + 归一化描述（不含行号，容忍重新分析时的行号漂移） */
+  /** 记录指纹（精确）：文件 + 归一化描述（不含行号，容忍重新分析时的行号漂移） */
   fingerprint: string
+  /** 记录指纹（宽松，P1-15①）：文件 + 类型 + 行号桶，描述文本不参与——模型措辞漂移重报同一问题时的兜底命中键；旧数据缺省视为无宽松键（仅精确匹配） */
+  looseFingerprint?: string
   /** 生效范围：'general' 为通用（跨仓库生效），否则为仓库名 */
   scope: string
   /** 处置类型：豁免或遵守 */

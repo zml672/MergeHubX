@@ -2,7 +2,7 @@
 
 import { httpRequest, httpStreamRequest } from '../http'
 import { extractError } from './errors'
-import type { AiModelConfig } from '../../types/ai'
+import { STREAM_TIMEOUT_RANGE, type AiModelConfig } from '../../types/ai'
 
 export interface TokenUsage {
   promptTokens: number
@@ -77,6 +77,26 @@ interface StreamChunkShape {
 const CHAT_TIMEOUT_SECS = 120
 const TEST_TIMEOUT_SECS = 30
 
+/** 流式总时长上限（P1-16 延伸）：显式思考/慢输出模型可能超过 600 秒，
+ * 用户可在模型档案调大；非法/缺省回退默认值。上下限与默认值单源自 STREAM_TIMEOUT_RANGE（types/ai.ts），
+ * 此处不重复硬编码（评审 #21）；Rust 侧钳制常量无法跨语言共享，靠测试对齐 */
+const { min: STREAM_TOTAL_TIMEOUT_MIN_SECS, max: STREAM_TOTAL_TIMEOUT_MAX_SECS, default: STREAM_TOTAL_TIMEOUT_SECS } = STREAM_TIMEOUT_RANGE
+
+/** 计算流式请求实际生效的总时长上限：仅接受区间内的有限正数，其余回退默认。
+ * 非流式的固定 CHAT_TIMEOUT_SECS 不受影响——两条超时语义彼此独立 */
+export function effectiveStreamTimeoutSecs(config: AiModelConfig): number {
+  const raw = config.streamTimeoutSecs
+  if (
+    typeof raw === 'number' &&
+    Number.isFinite(raw) &&
+    raw >= STREAM_TOTAL_TIMEOUT_MIN_SECS &&
+    raw <= STREAM_TOTAL_TIMEOUT_MAX_SECS
+  ) {
+    return Math.floor(raw)
+  }
+  return STREAM_TOTAL_TIMEOUT_SECS
+}
+
 const STREAM_CANCELLED_MARKER = 'HTTP_STREAM_CANCELLED'
 
 /** 批次评审与第二遍复核共用的默认并发数：调大可缩短总耗时，但过大会触发 API 限流 */
@@ -94,6 +114,14 @@ export function effectiveConcurrency(config: AiModelConfig, cap: number): number
 
 function endpointOf(baseUrl: string): string {
   return `${baseUrl.trim().replace(/\/+$/, '')}/chat/completions`
+}
+
+/** 组装思考力度请求参数（P1-16）：显式选档才携带 reasoning_effort，缺省不发送（跟随模型默认）。
+ * 智谱官方默认 max 且 GLM-5.3 系强制思考不可关闭，评审请求不控档会动辄思考 90K+ 触顶 600 秒截断；
+ * 此参数仅 GLM-5.2+ 支持（5.3 系只认 low/high/max），不支持的端点收到多余字段大多忽略——
+ * 不在此处按模型名猜测支持性：非智谱端点由用户自行选档，发错字段的责任不放进客户端 */
+function thinkingParamOf(config: AiModelConfig): { reasoning_effort?: string } {
+  return config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}
 }
 
 function parseUsage(raw: {
@@ -139,6 +167,7 @@ export async function chatCompletion(
       messages,
       temperature: 0.2,
       stream: false,
+      ...thinkingParamOf(config),
     }),
     timeoutSecs,
   })
@@ -239,12 +268,14 @@ export async function chatCompletionStream(
       url: endpointOf(config.baseUrl),
       method: 'POST',
       headers,
+      timeoutSecs: effectiveStreamTimeoutSecs(config),
       body: JSON.stringify({
         model: config.model,
         messages,
         temperature: 0.2,
         stream: true,
         stream_options: { include_usage: true },
+        ...thinkingParamOf(config),
       }),
     },
     consume,

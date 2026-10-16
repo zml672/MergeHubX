@@ -15,7 +15,12 @@ const SECRET_SERVICE: &str = "mergehub";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const USER_AGENT: &str = concat!("MergeHub/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT_SECS: u64 = 10;
+/// 流式总时长默认上限：显式思考/慢输出的模型（如 GLM-5.3 系 reasoning）可能超过 600 秒，
+/// 前端可经 HttpOptions.timeout_secs 携带自定义值（P1-16 延伸），未携带时用此默认
 const STREAM_TOTAL_TIMEOUT_SECS: u64 = 600;
+/// 流式总时长上下限：下限需给空闲检测（90s）留出意义，上限防手滑把兜底保险丝拆掉
+const STREAM_TOTAL_TIMEOUT_MIN_SECS: u64 = 120;
+const STREAM_TOTAL_TIMEOUT_MAX_SECS: u64 = 3600;
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
 
 const STREAM_CANCELLED: &str = "HTTP_STREAM_CANCELLED";
@@ -196,9 +201,15 @@ pub async fn http_request_stream(
     )
     .map_err(|e| format!("无效的 HTTP 方法: {e}"))?;
 
+    // 总时长上限：前端显式携带且在合法区间内才生效，缺省/越界一律回退默认（Rust 侧二次钳制，
+    // 不信任 JS 归一化——手改存储或跨版本脏数据在这里仍是安全的）
+    let total_timeout_secs = match options.timeout_secs {
+        Some(secs) if (STREAM_TOTAL_TIMEOUT_MIN_SECS..=STREAM_TOTAL_TIMEOUT_MAX_SECS).contains(&secs) => secs,
+        _ => STREAM_TOTAL_TIMEOUT_SECS,
+    };
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(STREAM_TOTAL_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(total_timeout_secs))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
 
@@ -279,7 +290,7 @@ pub async fn http_request_stream(
                     "模型始终未完成输出"
                 };
                 format!(
-                    "模型响应中断：总时长超过 {STREAM_TOTAL_TIMEOUT_SECS} 秒上限（{phase}），请重试或减小本次评审范围"
+                    "模型响应中断：总时长超过 {total_timeout_secs} 秒上限（{phase}），请重试、减小本次评审范围或在模型设置中调大流式总时长"
                 )
             } else {
                 format!("读取响应失败: {e}")

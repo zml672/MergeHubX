@@ -35,6 +35,7 @@ const {
   prevStats,
   summaryStats,
   statLines,
+  pendingStats,
   aiReviewing,
   aiError,
   aiLog,
@@ -99,6 +100,9 @@ function onErrorAction() {
 
 /** 复核摘要明细展开状态：默认只展示一行摘要 */
 const verifyExpanded = ref(false)
+
+/** 豁免拦截明细展开状态：与复核摘要同款交互 */
+const exemptExpanded = ref(false)
 
 /** 跳转治理工作台查看豁免记录 */
 const router = useRouter()
@@ -279,6 +283,18 @@ function confirmGovern() {
               </span>
             </div>
             <div class="ai-stat-summary">
+              <div class="ai-stat-line is-focus">
+                本轮新增待处理
+                <span class="ai-stat-num">{{ pendingStats.pending }}</span>
+                条<template v-if="pendingStats.exempt > 0 || pendingStats.fixed > 0"
+                  >（<template v-if="pendingStats.exempt > 0"
+                    >已豁免 <span class="ai-stat-num is-low">{{ pendingStats.exempt }}</span></template
+                  ><template v-if="pendingStats.exempt > 0 && pendingStats.fixed > 0">、</template
+                  ><template v-if="pendingStats.fixed > 0"
+                    >上轮已修复 <span class="ai-stat-num is-low">{{ pendingStats.fixed }}</span> 未计入</template
+                  >）</template
+                >
+              </div>
               <div class="ai-stat-line">
                 本次共分析
                 <span class="ai-stat-num">{{ summaryStats.totalFiles }}</span>
@@ -337,6 +353,30 @@ function confirmGovern() {
                   <span class="ai-verify-file">{{ issue.file }}:{{ issue.line }}</span>
                   <span class="ai-verify-note">{{ issue.comment }}</span>
                   <span v-if="issue.verifyReason" class="ai-verify-reason">误报原因：{{ issue.verifyReason }}</span>
+                </div>
+              </div>
+            </div>
+            <div v-if="aiResult?.exempted" class="ai-verify-line">
+              <a class="ai-verify-toggle" @click="exemptExpanded = !exemptExpanded">
+                已拦截
+                <span class="ai-stat-num is-low">{{ aiResult.exempted.count }}</span>
+                条命中治理豁免的问题，未进入清单与复核
+                <DownOutlined class="ai-verify-arrow" :class="{ 'is-expanded': exemptExpanded }" />
+              </a>
+              <div
+                v-if="exemptExpanded && aiResult.exempted.issues.length > 0"
+                class="ai-verify-detail"
+              >
+                <div
+                  v-for="(issue, i) in aiResult.exempted.issues"
+                  :key="`${issue.file}:${issue.line}:${i}`"
+                  class="ai-verify-item"
+                >
+                  <span class="ai-verify-file">{{ issue.file }}:{{ issue.line }}</span>
+                  <span class="ai-verify-note">{{ issue.comment }}</span>
+                </div>
+                <div class="ai-verify-item">
+                  <a-button size="small" type="link" @click="openGovernance">前往治理查看 ›</a-button>
                 </div>
               </div>
             </div>

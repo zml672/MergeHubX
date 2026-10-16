@@ -12,7 +12,9 @@ import type {
   AiReviewResult,
   AiReviewResumePoint,
   AiReviewRunLog,
+  ThinkingEffort,
 } from '../types/ai'
+import { normalizeThinkingEffort, normalizeStreamTimeoutSecs } from '../types/ai'
 import type { DiffFile, PullRequestDetail, Platform } from '../types/platform'
 import { useGovernanceIssuesStore } from './governanceIssues'
 import { useReviewRulesStore } from './reviewRules'
@@ -381,6 +383,8 @@ export const useAiStore = defineStore('ai', {
         baseUrl: string
         model: string
         concurrency?: number
+        reasoningEffort?: ThinkingEffort
+        streamTimeoutSecs?: number
       },
       apiKey: string,
     ): AiModelProfile {
@@ -392,6 +396,8 @@ export const useAiStore = defineStore('ai', {
         baseUrl: input.baseUrl.trim(),
         model: input.model.trim(),
         concurrency: input.concurrency,
+        reasoningEffort: normalizeThinkingEffort(input.reasoningEffort),
+        streamTimeoutSecs: normalizeStreamTimeoutSecs(input.streamTimeoutSecs),
       }
       const index = this.profiles.findIndex((p) => p.id === id)
       if (index >= 0) this.profiles.splice(index, 1, normalized)
@@ -428,6 +434,8 @@ export const useAiStore = defineStore('ai', {
         model: profile?.model.trim() ?? '',
         apiKey: (this.apiKeyMap[profileId] ?? '').trim(),
         concurrency: profile?.concurrency,
+        reasoningEffort: normalizeThinkingEffort(profile?.reasoningEffort),
+        streamTimeoutSecs: normalizeStreamTimeoutSecs(profile?.streamTimeoutSecs),
       }
     },
     modelConfig(): AiModelConfig {
@@ -587,6 +595,23 @@ export const useAiStore = defineStore('ai', {
             endedAt: Date.now(),
           })
           persistLogs(this.reviewLogs)
+          break
+        }
+        case 'exemptDone': {
+          // 纵深防御：引擎仅在 count>0 时派发（engine.ts 有守卫+测试钉死），消费端仍自行
+          // 判定——「0 条命中」的空步骤属纯噪音，一旦上游防线被重构破坏也不污染日志
+          if (event.count > 0) {
+            log.steps.push({
+              key: 'exempt',
+              title: '豁免拦截完成',
+              // 拦截不阻断主流程：命中即剔除（程序保证，与提示词软约束互补），步骤恒为 done
+              status: 'done',
+              detail: `${event.count} 条意见命中治理豁免记录，已移出清单与复核（省去无效复核开销）`,
+              startedAt: 0,
+              endedAt: Date.now(),
+            })
+            persistLogs(this.reviewLogs)
+          }
           break
         }
         case 'verifyStart': {

@@ -9,6 +9,7 @@ import {
   SEVERITY_WEIGHT,
   compareGroupRisk,
   mdCell,
+  pendingNoteOf,
 } from './useAiReviewFlow'
 import type { AiReviewFlow } from './useAiReviewFlow'
 
@@ -35,6 +36,12 @@ export function useReviewExport(flow: AiReviewFlow) {
       '',
       `本次共分析 ${stats.totalFiles} 个变更文件，其中 ${stats.issueFileCount} 个文件发现问题：高风险 ${stats.high} · 中风险 ${stats.medium} · 低风险 ${stats.low}`,
     ]
+
+    // 本轮新增待处理（P1-15③）与报告统计块同口径：总意见 − 豁免命中 − 上轮已修复确认；
+    // 附注文案经 pendingNoteOf 单源组装（评审 #24：零计数片段不拼接）
+    const pending = flow.pendingStats.value
+    const note = pendingNoteOf(pending)
+    lines.push('', `**本轮新增待处理 ${pending.pending} 条**${note ? `（${note}）` : ''}`, '')
 
     const checks = result.previousChecks ?? []
     if (checks.length > 0) {

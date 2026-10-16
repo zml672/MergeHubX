@@ -11,7 +11,9 @@ import { relocateIssues } from './locate'
 import type { ContentCache, OversizedFileSet, RelocateStat } from './locate'
 import type { FileContentFetcher } from './verify'
 import { localLogDir, remoteLogDir, logAiRequest, logAiAnswer, logAiError, shortHash } from '../aiDebugLog'
-import type { AiModelConfig, AiReviewResult, GovernanceRecord, ReviewRule } from '../../types/ai'
+import { issueFingerprints } from '../../utils/issueFingerprint'
+import { dedupeAndSortIssues } from './merge'
+import type { AiIssue, AiModelConfig, AiReviewResult, GovernanceRecord, ReviewRule } from '../../types/ai'
 import type { PullRequestDetail } from '../../types/platform'
 import type { ChatMessage, ReviewCancelHandle, TokenUsage } from './client'
 
@@ -50,6 +52,11 @@ export type AiReviewEvent =
       result?: AiReviewResult
     }
   | { type: 'relocateDone'; stat: RelocateStat }
+  | {
+      type: 'exemptDone'
+      /** 引擎层拦截的豁免意见数：0 条不发本事件 */
+      count: number
+    }
   | { type: 'verifyStart'; files: number; issues: number }
   | {
       type: 'verifyDone'
@@ -93,6 +100,39 @@ function delay(ms: number): Promise<void> {
 export function isRetryableNetworkError(err: unknown): boolean {
   const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
   return RETRYABLE_ERROR_PATTERN.test(message)
+}
+
+/**
+ * 引擎层豁免前置拦截（P1-15②）：从各批次结果中移除命中治理豁免记录的意见，移出报告主体、
+ * 不再进入全文复核——豁免问题已由人工定性，复核花 token 重验没有意义。
+ * 时机在 relocate 之后、verify 之前：拦截依赖重定位产出的可信坐标（宽松指纹按行号桶匹配），
+ * 拦截后复核清单缩小，token 花在未定性问题上。
+ * 匹配口径与治理 store.isRecorded 同源（issueFingerprints 精确/宽松双键，命中任一即拦截）；
+ * exempt 已由调用方按「通用层 + 本仓库 + exempt 处置」过滤，此处不再按 scope/处置区分。
+ * 提示词豁免段是软约束（模型可能仍报出），本函数是硬闸门（程序保证拦截）——两道防线互补。
+ * 返回移出意见的去重排序清单（merge 同口径去重，跨批重复报同一问题只计一条）
+ */
+export function filterExemptedIssues(
+  results: AiReviewResult[],
+  exempt: GovernanceRecord[],
+): AiIssue[] {
+  if (exempt.length === 0) return []
+  const exactKeys = new Set(exempt.map((r) => r.fingerprint))
+  const looseKeys = new Set(
+    exempt.flatMap((r) => (r.looseFingerprint !== undefined ? [r.looseFingerprint] : [])),
+  )
+  const removed: AiIssue[] = []
+  for (const result of results) {
+    if (result.issues.length === 0) continue
+    const kept: AiIssue[] = []
+    for (const issue of result.issues) {
+      const { exact, loose } = issueFingerprints(issue)
+      if (exactKeys.has(exact) || looseKeys.has(loose)) removed.push(issue)
+      else kept.push(issue)
+    }
+    if (kept.length !== result.issues.length) result.issues = kept
+  }
+  return dedupeAndSortIssues(removed)
 }
 
 async function reviewOnce(
@@ -433,6 +473,13 @@ export async function reviewPullRequest(
     onEvent?.({ type: 'relocateDone', stat: relocateStat })
   }
 
+  // 豁免前置拦截（P1-15②）：先于复核剔除命中豁免库的意见——复核清单缩小省 token；
+  // 放 relocate 之后保证宽松指纹匹配的是重定位修正后的可信坐标
+  const exemptedIssues = filterExemptedIssues(results, exempt)
+  if (exemptedIssues.length > 0) {
+    onEvent?.({ type: 'exemptDone', count: exemptedIssues.length })
+  }
+
   const verifyOutcome = await verifyIssues(
     config,
     results,
@@ -447,6 +494,7 @@ export async function reviewPullRequest(
   )
   const merged = await mergeResults(config, results, previous, onEvent, cancel, logDir)
   if (verifyOutcome) merged.result.verify = verifyOutcome.stat
+  if (exemptedIssues.length > 0) merged.result.exempted = { count: exemptedIssues.length, issues: exemptedIssues }
   onEvent?.({
     type: 'done',
     elapsedMs: Date.now() - startedAt,

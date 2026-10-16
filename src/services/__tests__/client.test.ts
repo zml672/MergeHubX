@@ -1,9 +1,9 @@
 // @vitest-environment node
 // SSE 流解析的边界行为（末段冲刷、跨块断行）与并发数计算的脏数据兜底
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { chatCompletionStream, DEFAULT_BATCH_CONCURRENCY, effectiveConcurrency } from '../ai/client'
-import { httpStreamRequest } from '../http'
-import type { AiModelConfig } from '../../types/ai'
+import { chatCompletionStream, DEFAULT_BATCH_CONCURRENCY, effectiveConcurrency, effectiveStreamTimeoutSecs } from '../ai/client'
+import { httpStreamRequest, type HttpOptions } from '../http'
+import { STREAM_TIMEOUT_RANGE, normalizeStreamTimeoutSecs, normalizeThinkingEffort, type AiModelConfig } from '../../types/ai'
 
 vi.mock('../http', async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -171,6 +171,86 @@ describe('线束 id：取消注册表一对一映射（停止按钮可靠性的�
       chatCompletionStream(config, [{ role: 'user', content: 'hi' }], undefined, cancel),
     ).rejects.toThrow()
     expect(cancel.streamIds.size).toBe(0)
+  })
+})
+
+describe('P1-16 思考力度透传（reasoning_effort）', () => {
+  const sseOk = `${sse({ choices: [{ delta: { content: 'ok' } }] })}\n`
+  /** 抓取发流时的请求体（JSON 字符串） */
+  async function capturedBody(cfg: AiModelConfig): Promise<Record<string, unknown>> {
+    let body: string | undefined
+    vi.mocked(httpStreamRequest).mockImplementation(async (options, onChunk) => {
+      body = String(options.body)
+      onChunk(sseOk)
+      return { status: 200, headers: {}, body: null }
+    })
+    await chatCompletionStream(cfg, [{ role: 'user', content: 'hi' }])
+    return JSON.parse(body ?? '{}') as Record<string, unknown>
+  }
+
+  it('缺省不发送：跟随模型默认，请求体不含 reasoning_effort（老配置零影响）', async () => {
+    const body = await capturedBody(config)
+    expect('reasoning_effort' in body).toBe(false)
+  })
+
+  it('显式选档透传：reasoning_effort 携带所选档位，其余请求体字段不受影响', async () => {
+    const body = await capturedBody({ ...config, reasoningEffort: 'low' })
+    expect(body.reasoning_effort).toBe('low')
+    expect(body.model).toBe('model-x')
+    expect(body.stream).toBe(true)
+    expect(body.stream_options).toEqual({ include_usage: true })
+  })
+
+  it('normalizeThinkingEffort：合法档位原样返回，枚举外脏值回退 undefined（不发送）', () => {
+    expect(normalizeThinkingEffort('low')).toBe('low')
+    expect(normalizeThinkingEffort('high')).toBe('high')
+    expect(normalizeThinkingEffort('max')).toBe('max')
+    expect(normalizeThinkingEffort('medium')).toBeUndefined() // 5.3 系不认的档位不发
+    expect(normalizeThinkingEffort('none')).toBeUndefined()
+    expect(normalizeThinkingEffort(undefined)).toBeUndefined()
+    expect(normalizeThinkingEffort(42)).toBeUndefined()
+  })
+})
+
+describe('P1-16 延伸：流式总时长上限钳制与透传', () => {
+  it('区间内的自定义值生效并向下取整', () => {
+    expect(effectiveStreamTimeoutSecs({ ...config, streamTimeoutSecs: 1200 })).toBe(1200)
+    expect(effectiveStreamTimeoutSecs({ ...config, streamTimeoutSecs: 120.9 })).toBe(120)
+    expect(effectiveStreamTimeoutSecs({ ...config, streamTimeoutSecs: 3600 })).toBe(3600)
+  })
+
+  it('缺省与越界/脏值回退默认值：保险丝不可被手滑拆掉', () => {
+    const { min, max, default: def } = STREAM_TIMEOUT_RANGE
+    expect(effectiveStreamTimeoutSecs(config)).toBe(def)
+    expect(effectiveStreamTimeoutSecs({ ...config, streamTimeoutSecs: min - 60 })).toBe(def) // 低于下限
+    expect(effectiveStreamTimeoutSecs({ ...config, streamTimeoutSecs: max + 3600 })).toBe(def) // 高于上限
+    expect(effectiveStreamTimeoutSecs({ ...config, streamTimeoutSecs: Number.NaN })).toBe(def)
+    expect(effectiveStreamTimeoutSecs({ ...config, streamTimeoutSecs: Number.POSITIVE_INFINITY })).toBe(def)
+  })
+
+  it('发流请求携带 timeoutSecs：自定义值透传给 Rust，缺省携带默认值', async () => {
+    async function capturedOptions(cfg: AiModelConfig): Promise<HttpOptions> {
+      let captured: HttpOptions | undefined
+      vi.mocked(httpStreamRequest).mockImplementation(async (options, onChunk) => {
+        captured = options
+        onChunk(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n`)
+        return { status: 200, headers: {}, body: null }
+      })
+      await chatCompletionStream(cfg, [{ role: 'user', content: 'hi' }])
+      return captured as HttpOptions
+    }
+    expect((await capturedOptions({ ...config, streamTimeoutSecs: 1800 })).timeoutSecs).toBe(1800)
+    expect((await capturedOptions(config)).timeoutSecs).toBe(STREAM_TIMEOUT_RANGE.default)
+  })
+
+  it('normalizeStreamTimeoutSecs：区间外整型与非整数回退 undefined（用默认值）', () => {
+    const { min, max } = STREAM_TIMEOUT_RANGE
+    expect(normalizeStreamTimeoutSecs(1200)).toBe(1200)
+    expect(normalizeStreamTimeoutSecs(min - 1)).toBeUndefined() // 低于下限
+    expect(normalizeStreamTimeoutSecs(max + 1)).toBeUndefined() // 高于上限
+    expect(normalizeStreamTimeoutSecs(600.5)).toBeUndefined() // 非整数
+    expect(normalizeStreamTimeoutSecs('1800')).toBeUndefined() // 字符串脏数据
+    expect(normalizeStreamTimeoutSecs(undefined)).toBeUndefined()
   })
 })
 

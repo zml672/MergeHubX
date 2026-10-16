@@ -6,7 +6,7 @@ import { estimateReviewPlan } from '../services/ai'
 import type { AiReviewMode } from '../services/ai'
 import { formatChars, formatDuration, useAiStore } from '../stores/ai'
 import { useGovernanceIssuesStore } from '../stores/governanceIssues'
-import { issueFingerprint } from '../utils/issueFingerprint'
+import { issueFingerprint, looseIssueFingerprint } from '../utils/issueFingerprint'
 import { useUiStore } from '../stores/ui'
 import type {
   AiIssue,
@@ -59,6 +59,36 @@ export const PREV_STATUS_META: Record<AiIssueStatus, { color: string; label: str
 
 /** 严重度风险权重：high=3 / medium=2 / low=1，与摘要统计、问题分组、导出 Markdown 三处共用同一口径 */
 export const SEVERITY_WEIGHT: Record<AiIssueSeverity, number> = { high: 3, medium: 2, low: 1 }
+
+/** 本轮新增待处理统计（P1-15③，导出供单元测试）：从报告意见清单中剔除两类「无需再处理」后
+ *  剩余的条数——① 豁免命中（治理已定性，引擎拦截不在清单、展示层隐藏事后豁免均不计）；
+ *  ② 上轮已修复确认（模型复述的上轮已修复问题，精确指纹匹配 prevStatus）。
+ *  这是治理闭环的收敛指标：处置完一轮，下轮只剩真正的新问题，该数可清零。
+ *  豁免判定优先于已修复（同一条两重身份只归豁免，不双计）；两项判定经回调注入，
+ *  与 recordOf / prevStatusIndex 的生产口径解耦，单测无需拉起整条 composable 依赖链 */
+export function pendingIssueStatsOf(
+  issues: AiIssue[],
+  isExempt: (issue: AiIssue) => boolean,
+  prevStatusOf: (issue: AiIssue) => AiIssueStatus | undefined,
+): { pending: number; fixed: number; exempt: number } {
+  let fixed = 0
+  let exempt = 0
+  for (const issue of issues) {
+    if (isExempt(issue)) exempt += 1
+    else if (prevStatusOf(issue) === 'fixed') fixed += 1
+  }
+  return { pending: issues.length - fixed - exempt, fixed, exempt }
+}
+
+/** 本轮新增待处理的附注文案（P1-15③，导出供单元测试与面板/导出共用单源）：
+ *  仅计数 >0 的片段才拼接（评审 #24：fixed=0 时「上轮已修复 0 未计入」表述冗余且误导），
+ *  零剔除返回空串（面板 v-if 隐藏附注、导出不追加括号） */
+export function pendingNoteOf(stats: { fixed: number; exempt: number }): string {
+  const parts: string[] = []
+  if (stats.exempt > 0) parts.push(`已豁免 ${stats.exempt}`)
+  if (stats.fixed > 0) parts.push(`上轮已修复 ${stats.fixed} 未计入`)
+  return parts.join('、')
+}
 
 /** 文件组风险排序：先比组内最高严重度（含严重问题的文件整体靠前），同档再比风险总分 */
 export function compareGroupRisk(
@@ -168,6 +198,17 @@ export function useAiReviewFlow(source: AiReviewFlowSource) {
       lines.push({ key: 'focus', label: '建议优先检查', files: stats.focusFiles, focus: true })
     return lines
   })
+
+  /** 本轮新增待处理（P1-15③）：报告头部置顶指标。总意见 − 豁免命中 − 上轮已修复确认，
+   *  判定回调与展示层 recordOf / prevStatusIndex 同源；prevStatusIndex 为 Map 查找，
+   *  直接传方法引用即可（this 无关）。导出 Markdown 与统计块共用该口径 */
+  const pendingStats = computed(() =>
+    pendingIssueStatsOf(
+      aiResult.value?.issues ?? [],
+      (issue) => recordOf(issue)?.disposition === 'exempt',
+      (issue) => prevStatusIndex.value.get(issueFingerprint(issue)),
+    ),
+  )
 
   const aiReviewing = computed(() =>
     Boolean(source.aiKey.value && aiStore.reviewing[source.aiKey.value]),
@@ -316,22 +357,45 @@ export function useAiReviewFlow(source: AiReviewFlowSource) {
   /** 问题组折叠态：key 为文件路径，点击组头部折叠/展开整个文件组 */
   const collapsedGroups = ref(new Set<string>())
 
-  /** 指纹 → 治理记录的映射：记录侧 Map 化中间层，供问题映射预查记录，避免逐条线性扫描（原实现为 O(问题数×记录数)） */
+  /** 指纹 → 治理记录的映射：精确与宽松双键入图（P1-15①），记录侧 Map 化中间层供问题映射预查，避免逐条线性扫描。
+   * 宽松键注册前置冲突检查：同键存在 exempt/comply 并存时不注册宽松键（recordOf 回退仅精确匹配）——
+   * Map 后写覆盖先写，若不检查，隐藏/展示判定会随记录数组顺序漂移，且与 store.isRecorded 的 any-hit 口径各说各话；
+   * 冲突回退即偏置原则：宁漏拦不误拦 */
   const governanceRecordByFingerprint = computed(() => {
     const repo = source.activeRepoId.value
     const map = new Map<string, GovernanceRecord>()
     if (!repo) return map
+    const looseDispositions = new Map<string, Set<IssueDisposition>>()
     for (const r of governanceStore.records) {
-      if (r.scope === 'general' || r.scope === repo) map.set(r.fingerprint, r)
+      if (r.scope !== 'general' && r.scope !== repo) continue
+      if (r.looseFingerprint !== undefined) {
+        let set = looseDispositions.get(r.looseFingerprint)
+        if (!set) {
+          set = new Set<IssueDisposition>()
+          looseDispositions.set(r.looseFingerprint, set)
+        }
+        set.add(r.disposition)
+      }
+    }
+    for (const r of governanceStore.records) {
+      if (r.scope === 'general' || r.scope === repo) {
+        map.set(r.fingerprint, r)
+        if (r.looseFingerprint !== undefined && looseDispositions.get(r.looseFingerprint)?.size === 1) {
+          map.set(r.looseFingerprint, r)
+        }
+      }
     }
     return map
   })
 
-  /** 问题 → 治理记录的映射：模板同一条目多处调 recordOf，原实现每处都现场计算指纹（正则归一化）；以问题对象引用为键预计算一次，分组/筛选/导出链路均透传 aiResult.issues 的原引用 */
+  /** 问题 → 治理记录的映射：模板同一条目多处调 recordOf，原实现每处都现场计算指纹（正则归一化）；以问题对象引用为键预计算一次，分组/筛选/导出链路均透传 aiResult.issues 的原引用。命中顺序：先精确指纹（唯一），未中再宽松指纹——宽松键已在上游做过处置冲突检查（冲突不注册），能命中即说明同桶处置统一，隐藏/展示判定与 store.isRecorded 口径一致；同处置多条记录时任取其一仅影响理由/描述展示 */
   const governanceRecordByIssue = computed(() => {
     const map = new Map<AiIssue, GovernanceRecord>()
     for (const issue of aiResult.value?.issues ?? []) {
-      const record = governanceRecordByFingerprint.value.get(issueFingerprint(issue))
+      const exactKey = issueFingerprint(issue)
+      const record =
+        governanceRecordByFingerprint.value.get(exactKey) ??
+        governanceRecordByFingerprint.value.get(looseIssueFingerprint(issue))
       if (record) map.set(issue, record)
     }
     return map
@@ -649,6 +713,7 @@ export function useAiReviewFlow(source: AiReviewFlowSource) {
     prevStats,
     summaryStats,
     statLines,
+    pendingStats,
     aiReviewing,
     aiError,
     aiLog,

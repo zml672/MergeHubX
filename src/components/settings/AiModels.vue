@@ -4,7 +4,7 @@ import { Modal, message } from 'ant-design-vue'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import { friendlyAiError, testAiConnection } from '../../services/ai'
 import { useAiStore } from '../../stores/ai'
-import { AI_PRESETS, aiPresetOf, type AiModelProfile } from '../../types/ai'
+import { AI_PRESETS, aiPresetOf, THINKING_EFFORT_META, type AiModelProfile, type ThinkingEffort } from '../../types/ai'
 import AiDebugLog from './AiDebugLog.vue'
 
 const ai = useAiStore()
@@ -21,7 +21,23 @@ const form = reactive({
   model: '',
   apiKey: '',
   concurrency: 2,
+  reasoningEffort: undefined as ThinkingEffort | undefined,
+  streamTimeoutSecs: undefined as number | undefined,
 })
+
+/** 思考力度下拉选项：只含三档，「跟随模型默认」不作为选项值存在（评审 #22）——
+ * 默认态由 placeholder + allow-clear 表达（清除后为 undefined），保证运行时值模型
+ * 与字段类型 ThinkingEffort | undefined 严格一致；若以 '' 作默认选项值，会在快照
+ * 脏检查中与 undefined 产生双重表示（"" 序列化 vs undefined 消失），未改动也误报 */
+const effortOptions = (Object.keys(THINKING_EFFORT_META) as ThinkingEffort[]).map((e) => ({
+  label: THINKING_EFFORT_META[e].label,
+  value: e,
+}))
+
+/** 思考力度选中值的提示文案（extra 行展示当前档位说明） */
+const effortHint = computed(() =>
+  form.reasoningEffort ? THINKING_EFFORT_META[form.reasoningEffort].hint : '不发送思考力度参数，由模型服务按默认策略决定（智谱 GLM-5.3 系默认深度推理）。',
+)
 let snapshot = ''
 
 onMounted(() => {
@@ -52,6 +68,8 @@ function openAdd() {
   form.model = ''
   form.apiKey = ''
   form.concurrency = 2
+  form.reasoningEffort = undefined
+  form.streamTimeoutSecs = undefined
   snapshot = snapshotForm()
   formOpen.value = true
 }
@@ -64,6 +82,8 @@ function openEdit(profile: AiModelProfile) {
   form.model = profile.model
   form.apiKey = ai.apiKeyMap[profile.id] ?? ''
   form.concurrency = profile.concurrency ?? 2
+  form.reasoningEffort = profile.reasoningEffort
+  form.streamTimeoutSecs = profile.streamTimeoutSecs
   snapshot = snapshotForm()
   formOpen.value = true
 }
@@ -100,6 +120,8 @@ async function submitProfile() {
         baseUrl: form.baseUrl,
         model: form.model,
         concurrency: form.concurrency,
+        reasoningEffort: form.reasoningEffort,
+        streamTimeoutSecs: form.streamTimeoutSecs,
       },
       form.apiKey,
     )
@@ -256,6 +278,27 @@ function removeProfile(profile: AiModelProfile) {
           extra="同时评审的批次数（1-6），调大可缩短总耗时；过大易触发 API 限流，限流时会自动等待重试。建议 1-3。"
         >
           <a-input-number v-model:value="form.concurrency" :min="1" :max="6" :precision="0" />
+        </a-form-item>
+        <a-form-item label="思考力度" :extra="effortHint">
+          <a-select
+            v-model:value="form.reasoningEffort"
+            :options="effortOptions"
+            placeholder="跟随模型默认"
+            allow-clear
+          />
+        </a-form-item>
+        <a-form-item
+          label="流式总时长上限（秒）"
+          extra="单次流式请求的总时长保险丝，默认 600；深度思考模型（如 GLM-5.3 系 max 档）可调大至 3600。空闲超时 90 秒固定不变，模型停止输出仍会及时中断。留空使用默认值。"
+        >
+          <a-input-number
+            v-model:value="form.streamTimeoutSecs"
+            :min="120"
+            :max="3600"
+            :precision="0"
+            :step="60"
+            placeholder="默认 600"
+          />
         </a-form-item>
         <div class="form-actions">
           <a-button :loading="testing" @click="testConnection">测试连接</a-button>

@@ -122,3 +122,46 @@ describe('ai store：results/logs/resumePoints 值级清洗（sanitizeObjectValu
     expect(store.results['good']?.issues).toEqual([])
   })
 })
+
+/** P1-15② 评审意见 #23：exemptDone 消费端纵深防御——count=0 不写日志步骤。
+ *  引擎侧已有守卫（count>0 才派发），此处钉死消费端：上游防线被破坏也不产生噪音步骤 */
+describe('ai store：applyReviewEvent 的 exemptDone 处理', () => {
+  /** 构造进行中的评审日志状态（applyReviewEvent 要求 reviewing 且日志未 done） */
+  function beginFakeReview(store: ReturnType<typeof useAiStore>, key: string) {
+    store.reviewing[key] = true
+    store.reviewLogs[key] = {
+      steps: [{ key: 'analyze', title: '分析变更代码', status: 'running', detail: '', startedAt: 1, endedAt: 0 }],
+      startedAt: 1,
+      endedAt: 0,
+      done: false,
+      canceled: false,
+      error: '',
+      totalBatches: 1,
+      sentChars: 0,
+      answerChars: 0,
+      reasoningChars: 0,
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    }
+  }
+
+  it('count>0：写入「豁免拦截完成」步骤，detail 携带计数', () => {
+    const store = useAiStore()
+    beginFakeReview(store, 'k1')
+    store.applyReviewEvent('k1', { type: 'exemptDone', count: 2 })
+    const steps = store.reviewLogs['k1']?.steps ?? []
+    const exempt = steps.find((s) => s.key === 'exempt')
+    expect(exempt).toBeDefined()
+    expect(exempt?.status).toBe('done')
+    expect(exempt?.detail).toContain('2 条')
+  })
+
+  it('count=0：不写步骤（防上游守卫失效后日志被噪音污染）', () => {
+    const store = useAiStore()
+    beginFakeReview(store, 'k2')
+    store.applyReviewEvent('k2', { type: 'exemptDone', count: 0 })
+    const steps = store.reviewLogs['k2']?.steps ?? []
+    expect(steps.find((s) => s.key === 'exempt')).toBeUndefined()
+    // 步骤数不变：只有初始的 analyze 一条
+    expect(steps).toHaveLength(1)
+  })
+})

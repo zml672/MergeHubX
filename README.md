@@ -14,7 +14,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![Ant Design Vue](https://img.shields.io/badge/Ant_Design_Vue-4.2-1677FF?logo=antdesign&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue)
-![Version](https://img.shields.io/badge/version-0.2.0-lightgrey)
+![Version](https://img.shields.io/badge/version-0.3.0-lightgrey)
 
 </div>
 
