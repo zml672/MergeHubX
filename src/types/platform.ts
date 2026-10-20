@@ -67,4 +67,12 @@ export interface PullRequestDetail extends PullRequestSummary {
   files: DiffFile[]
 }
 
+/** PR/MR 评论（R2 评审意见回写用，仅保留回写定位所需字段） */
+export interface PullRequestComment {
+  id: number
+  body: string
+  /** 创建时间毫秒时间戳（实现归一）；排序兜底用，缺省按原位序参与排序 */
+  createdAt?: number
+}
+
 export const PLATFORMS: Platform[] = ['github', 'gitlab', 'gitee']

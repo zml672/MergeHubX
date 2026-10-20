@@ -382,3 +382,44 @@
   flex-direction: column;
   gap: 12px;
 }
+
+/* 回写评论确认弹窗：将发布的评论原文预览 */
+.write-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.write-preview-meta {
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.65);
+}
+
+.write-preview-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.write-preview-body {
+  margin: 0;
+  width: 100%;
+  max-height: 320px;
+  min-height: 200px;
+  overflow: auto;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  font-family: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: rgba(0, 0, 0, 0.88);
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.write-preview-body:focus {
+  outline: none;
+  border-color: #1677ff;
+}

@@ -1,6 +1,7 @@
 import type {
   MergeMethod,
   PlatformAccount,
+  PullRequestComment,
   PullRequestDetail,
   PullRequestQuery,
   PullRequestSummary,
@@ -9,10 +10,15 @@ import { httpRequest } from '../http'
 import type { PlatformProvider } from './types'
 import {
   assertOk,
+  compareByCreatedAt,
   decodeBase64Text,
+  fetchAllComments,
   mapDiffStatus,
   MAX_REMOTE_FILE_BASE64_CHARS,
+  parseCreatedAt,
+  parseJsonSafe,
   splitRepo,
+  warnCommentTruncation,
 } from './utils'
 
 const GITHUB_API = 'https://api.github.com'
@@ -61,7 +67,7 @@ export const githubProvider: PlatformProvider = {
       },
     })
     assertOk(res.status, res.body, 'GitHub')
-    const user = JSON.parse(res.body) as { login?: string }
+    const user = parseJsonSafe<{ login?: string }>(res.body, 'GitHub', 'user')
     return user.login ?? ''
   },
 
@@ -80,7 +86,7 @@ export const githubProvider: PlatformProvider = {
       },
     })
     assertOk(res.status, res.body, 'GitHub')
-    const pulls = JSON.parse(res.body) as GithubPull[]
+    const pulls = parseJsonSafe<GithubPull[]>(res.body, 'GitHub', 'pulls 列表')
     return pulls.map((p) => ({
       key: `github-${p.base.repo?.full_name ?? query.repo}#${p.number}`,
       platform: 'github',
@@ -116,7 +122,11 @@ export const githubProvider: PlatformProvider = {
       headers,
     })
     assertOk(pullRes.status, pullRes.body, 'GitHub')
-    const p = JSON.parse(pullRes.body) as GithubPullDetail
+    const p = parseJsonSafe<GithubPullDetail>(
+      pullRes.body,
+      'GitHub',
+      `pulls/${number} 详情`,
+    )
     const rawFiles: GithubFile[] = []
     let page = 1
     while (page <= MAX_FILE_PAGES) {
@@ -125,7 +135,11 @@ export const githubProvider: PlatformProvider = {
         headers,
       })
       assertOk(filesRes.status, filesRes.body, 'GitHub')
-      const chunk = JSON.parse(filesRes.body) as GithubFile[]
+      const chunk = parseJsonSafe<GithubFile[]>(
+        filesRes.body,
+        'GitHub',
+        `pulls/${number}/files 第 ${page} 页`,
+      )
       rawFiles.push(...chunk)
       if (chunk.length < 100) break
       page += 1
@@ -133,6 +147,14 @@ export const githubProvider: PlatformProvider = {
     console.debug(
       `[github] ${repo}#${number} 文件列表拉取 ${Math.min(page, MAX_FILE_PAGES)} 页 / ${rawFiles.length} 个文件`,
     )
+    // 护栏触发可见化（族B 收口，同 #34 口径）：末页仍满页 = 可能截断，此时上方
+    // 「与 changed_files 不一致」的 warn 虽也会触发，但只报条数差、不点明截断原因，
+    // 诊断信息弱；显式告警让「评审漏了文件」可直接归因到护栏
+    if (rawFiles.length >= 100 * MAX_FILE_PAGES || (page > MAX_FILE_PAGES)) {
+      console.warn(
+        `[github] ${repo}#${number} 文件列表翻页达护栏上限 ${MAX_FILE_PAGES} 页（${rawFiles.length} 个），列表可能被截断，评审将漏检超限部分的变更文件`,
+      )
+    }
     if (rawFiles.length !== p.changed_files) {
       console.warn(
         `[github] ${repo}#${number} 拉取文件数 ${rawFiles.length} 与 changed_files=${p.changed_files} 不一致`,
@@ -250,10 +272,11 @@ export const githubProvider: PlatformProvider = {
       },
     })
     assertOk(res.status, res.body, 'GitHub')
-    const payload = JSON.parse(res.body) as {
-      content?: string | null
-      encoding?: string
-    }
+    const payload = parseJsonSafe<{ content?: string | null; encoding?: string }>(
+      res.body,
+      'GitHub',
+      `contents/${path}`,
+    )
     // 仅校验编码类型：空文件的 content 为空串是合法返回，应解码为空文本而非误判「内容不可用」（否则该文件被静默跳过复核）；超大文件 GitHub 返回非 base64 编码仍走抛错
     if (payload.encoding !== 'base64') {
       throw new Error(`GitHub 文件内容不可用：${path}`)
@@ -266,5 +289,89 @@ export const githubProvider: PlatformProvider = {
       )
     }
     return decodeBase64Text(content)
+  },
+
+  // GitHub 的 PR 评论即 issue comments（PR 是特殊 issue），一个端点覆盖读取/发布/编辑。
+  // 翻页拉全量（types.ts 约定「归一为正序全量」；评审 #32：只取首页会让超 100 条评论的 PR
+  // 漏检末尾的最新汇总评论，幂等更新退化为重复发布）。per_page=100，条数 <100 即止；
+  // 循环骨架/护栏/告警统一走 utils.fetchAllComments（评审 #59）
+  async listPullRequestComments(
+    account: PlatformAccount,
+    repo: string,
+    number: number,
+  ): Promise<{ comments: PullRequestComment[]; truncated: boolean }> {
+    const [owner, name] = splitRepo(repo)
+    const base = (account.baseUrl || GITHUB_API).replace(/\/+$/, '')
+    const { items, truncated } = await fetchAllComments<{
+      id: number
+      body: string
+      created_at?: string
+    }>({
+      // 条数驱动：items.length < 100 即末页（done）；满页时平台必可翻下一页（hasNext）
+      fetchPage: async (page) => {
+        const res = await httpRequest({
+          // sort/direction 显式固定 created 升序（评审 #47）：truncated「截掉的是最新区间」
+          // 的语义不能赌平台默认排序（默认值变更即失真），与 GitLab sort=asc&order_by=created_at
+          // 口径对齐；本地排序兜底仍保留（双保险，见列表拉取后）
+          url: `${base}/repos/${owner}/${name}/issues/${number}/comments?per_page=100&sort=created&direction=asc&page=${page}`,
+          headers: {
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            ...(account.token ? { Authorization: `Bearer ${account.token}` } : {}),
+          },
+        })
+        assertOk(res.status, res.body, 'GitHub')
+        const listUrl = `${base}/repos/${owner}/${name}/issues/${number}/comments`
+        const pageItems = parseJsonSafe<
+          {
+            id: number
+            body: string
+            created_at?: string
+          }[]
+        >(res.body, 'GitHub', listUrl)
+        return { items: pageItems, done: pageItems.length < 100, hasNext: pageItems.length >= 100 }
+      },
+      onTruncated: (fetchedCount) => warnCommentTruncation('github', repo, number, fetchedCount),
+    })
+    const comments = items.map((c) => ({
+      id: c.id,
+      body: c.body,
+      createdAt: parseCreatedAt(c.created_at),
+    }))
+    // created_at 升序排序兜底（评审 #41）：服务端排序参数之上再按时间戳本地归一（双保险）；
+    // 缺失/非法时间戳视作最旧排最前（评审 #48，比较器单源见 utils.compareByCreatedAt）
+    comments.sort(compareByCreatedAt)
+    return { comments, truncated }
+  },
+
+  async upsertPullRequestComment(
+    account: PlatformAccount,
+    repo: string,
+    number: number,
+    commentId: number | null,
+    body: string,
+  ): Promise<number> {
+    const [owner, name] = splitRepo(repo)
+    const base = (account.baseUrl || GITHUB_API).replace(/\/+$/, '')
+    const res = await httpRequest({
+      url:
+        commentId === null
+          ? `${base}/repos/${owner}/${name}/issues/${number}/comments`
+          : `${base}/repos/${owner}/${name}/issues/comments/${commentId}`,
+      method: commentId === null ? 'POST' : 'PATCH',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        ...(account.token ? { Authorization: `Bearer ${account.token}` } : {}),
+      },
+      body: JSON.stringify({ body }),
+    })
+    assertOk(res.status, res.body, 'GitHub')
+    return parseJsonSafe<{ id: number }>(
+      res.body,
+      'GitHub',
+      commentId === null ? 'issues comments 发布' : `issues comments/${commentId} 更新`,
+    ).id
   },
 }

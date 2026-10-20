@@ -2,6 +2,7 @@ import type {
   DiffFileStatus,
   MergeMethod,
   PlatformAccount,
+  PullRequestComment,
   PullRequestDetail,
   PullRequestQuery,
   PullRequestSummary,
@@ -10,9 +11,14 @@ import { httpRequest } from '../http'
 import type { PlatformProvider } from './types'
 import {
   assertOk,
+  compareByCreatedAt,
   countDiffLines,
   decodeBase64Text,
+  fetchAllComments,
   MAX_REMOTE_FILE_BASE64_CHARS,
+  parseCreatedAt,
+  parseJsonSafe,
+  warnCommentTruncation,
 } from './utils'
 
 const GITLAB_API = 'https://gitlab.com'
@@ -65,20 +71,36 @@ async function fetchMrDiffFiles(
   base: string,
   projectPath: string,
   number: number,
+  repo: string,
   headers: Record<string, string> | undefined,
 ): Promise<GitlabDiff[]> {
   const endpoints: { url: string; parse: (body: string) => GitlabDiff[] }[] = [
     {
       url: `${base}/api/v4/projects/${projectPath}/merge_requests/${number}/diffs?per_page=100`,
-      parse: (body) => JSON.parse(body) as GitlabDiff[],
+      parse: (body) =>
+        parseJsonSafe<GitlabDiff[]>(
+          body,
+          'GitLab',
+          `merge_requests/${number}/diffs`,
+        ),
     },
     {
       url: `${base}/api/v4/projects/${projectPath}/merge_requests/${number}/diffs?per_page=100&access_raw_diffs=true`,
-      parse: (body) => JSON.parse(body) as GitlabDiff[],
+      parse: (body) =>
+        parseJsonSafe<GitlabDiff[]>(
+          body,
+          'GitLab',
+          `merge_requests/${number}/diffs?access_raw_diffs=true`,
+        ),
     },
     {
       url: `${base}/api/v4/projects/${projectPath}/merge_requests/${number}/changes`,
-      parse: (body) => (JSON.parse(body) as GitlabChangesResponse).changes ?? [],
+      parse: (body) =>
+        parseJsonSafe<GitlabChangesResponse>(
+          body,
+          'GitLab',
+          `merge_requests/${number}/changes`,
+        ).changes ?? [],
     },
   ]
   const cacheKey = `${base}|${projectPath}`
@@ -96,6 +118,14 @@ async function fetchMrDiffFiles(
         const next = headerValue(res.headers, 'x-next-page')
         if (!next) break
         url = `${endpoint.url}&page=${next}`
+        // 护栏触发可见化（族B 收口，同 #34 口径）：耗尽页数仍有下一页 = 可能截断，
+        // 静默退出会让「评审漏了文件」无从归因；fetch 失败在上层有 endpoints 重试兜底，
+        // 截断只告警不抛错（diff 拉取本身属尽力而为，漏检由评审报告的文件数体现）
+        if (page === MAX_DIFF_PAGES) {
+          console.warn(
+            `[gitlab] ${repo}#${number} diff 翻页达护栏上限 ${MAX_DIFF_PAGES} 页，列表可能被截断，评审将漏检超限部分的变更文件`,
+          )
+        }
       }
       preferredDiffEndpoint.set(cacheKey, i)
       return files
@@ -130,7 +160,7 @@ export const gitlabProvider: PlatformProvider = {
       headers: account.token ? { 'PRIVATE-TOKEN': account.token } : undefined,
     })
     assertOk(res.status, res.body, 'GitLab')
-    const user = JSON.parse(res.body) as { username?: string }
+    const user = parseJsonSafe<{ username?: string }>(res.body, 'GitLab', 'user')
     return user.username ?? ''
   },
 
@@ -146,7 +176,7 @@ export const gitlabProvider: PlatformProvider = {
       headers: account.token ? { 'PRIVATE-TOKEN': account.token } : undefined,
     })
     assertOk(res.status, res.body, 'GitLab')
-    const mrs = JSON.parse(res.body) as GitlabMergeRequest[]
+    const mrs = parseJsonSafe<GitlabMergeRequest[]>(res.body, 'GitLab', 'merge_requests 列表')
     return mrs.map((mr) => ({
       key: `gitlab-${query.repo}#${mr.iid}`,
       platform: 'gitlab',
@@ -181,12 +211,22 @@ export const gitlabProvider: PlatformProvider = {
         headers,
       })
       assertOk(mrRes.status, mrRes.body, 'GitLab')
-      mr = JSON.parse(mrRes.body) as GitlabMergeRequestDetail
+      mr = parseJsonSafe<GitlabMergeRequestDetail>(
+        mrRes.body,
+        'GitLab',
+        `merge_requests/${number} 详情`,
+      )
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       throw new Error(`获取 MR 详情失败：${message}`)
     }
-    const rawDiffs = await fetchMrDiffFiles(base, projectPath, number, headers)
+    const rawDiffs = await fetchMrDiffFiles(
+      base,
+      projectPath,
+      number,
+      repo,
+      headers,
+    )
     const files = rawDiffs.map((d) => {
       const { additions, deletions } = countDiffLines(d.diff)
       return {
@@ -295,10 +335,11 @@ export const gitlabProvider: PlatformProvider = {
       headers: account.token ? { 'PRIVATE-TOKEN': account.token } : undefined,
     })
     assertOk(res.status, res.body, 'GitLab')
-    const payload = JSON.parse(res.body) as {
-      content?: string | null
-      encoding?: string
-    }
+    const payload = parseJsonSafe<{ content?: string | null; encoding?: string }>(
+      res.body,
+      'GitLab',
+      `repository/files/${path}`,
+    )
     // 仅校验编码类型：空文件的 content 为空串是合法返回，应解码为空文本而非误判「内容不可用」（否则该文件被静默跳过复核）
     if (payload.encoding !== 'base64') {
       throw new Error(`GitLab 文件内容不可用：${path}`)
@@ -311,5 +352,89 @@ export const gitlabProvider: PlatformProvider = {
       )
     }
     return decodeBase64Text(content)
+  },
+
+  // GitLab 的 MR 评论 = notes：系统注记（assigned to / approved 等状态流水）靠 system:true
+  // 标识，其 type 同样为 null（评审 #26 纠偏：type 仅区分 DiffNote/DiscussionNote 等讨论
+  // 形态，按 type===null 过滤挡不住系统注记反而错杀行内评论）；故按 system!==true 过滤，
+  // 行内评论保留——检索锚点匹配不受影响。sort=asc 拉正序；X-Next-Page 响应头翻页拉全量
+  // （评审 #32：sort=asc 下最新评论排在末页，只取首页必漏检 → 幂等退化重复发布）。
+  // 循环骨架/护栏/告警统一走 utils.fetchAllComments（评审 #59），头驱动语义由 fetchPage
+  // 返回值表达：响应头无下一页 = done；有下一页 = hasNext
+  async listPullRequestComments(
+    account: PlatformAccount,
+    repo: string,
+    number: number,
+  ): Promise<{ comments: PullRequestComment[]; truncated: boolean }> {
+    const base = (account.baseUrl || GITLAB_API).replace(/\/+$/, '')
+    const projectPath = encodeURIComponent(repo)
+    const endpoint = `${base}/api/v4/projects/${projectPath}/merge_requests/${number}/notes?per_page=100&sort=asc&order_by=created_at`
+    const { items, truncated } = await fetchAllComments<{
+      id: number
+      body: string
+      system: boolean
+      created_at?: string
+    }>({
+      fetchPage: async (page) => {
+        const url = page === 1 ? endpoint : `${endpoint}&page=${page}`
+        const res = await httpRequest({
+          url,
+          headers: account.token ? { 'PRIVATE-TOKEN': account.token } : undefined,
+        })
+        assertOk(res.status, res.body, 'GitLab')
+        const pageItems = parseJsonSafe<
+          {
+            id: number
+            body: string
+            system: boolean
+            created_at?: string
+          }[]
+        >(res.body, 'GitLab', url)
+        const hasNext = headerValue(res.headers, 'x-next-page') !== ''
+        return { items: pageItems, done: !hasNext, hasNext }
+      },
+      onTruncated: (fetchedCount) => warnCommentTruncation('gitlab', repo, number, fetchedCount),
+    })
+    // 系统注记（system:true）滤除
+    const comments = items
+      .filter((n) => n.system !== true)
+      .map((n) => ({
+        id: n.id,
+        body: n.body,
+        createdAt: parseCreatedAt(n.created_at),
+      }))
+    // created_at 升序排序兜底（评审 #41）：服务端 order_by=created_at&sort=asc 之上再按
+    // 时间戳本地归一（双保险）；缺失/非法时间戳视作最旧排最前（评审 #48）
+    comments.sort(compareByCreatedAt)
+    return { comments, truncated }
+  },
+
+  async upsertPullRequestComment(
+    account: PlatformAccount,
+    repo: string,
+    number: number,
+    commentId: number | null,
+    body: string,
+  ): Promise<number> {
+    const base = (account.baseUrl || GITLAB_API).replace(/\/+$/, '')
+    const projectPath = encodeURIComponent(repo)
+    const res = await httpRequest({
+      url:
+        commentId === null
+          ? `${base}/api/v4/projects/${projectPath}/merge_requests/${number}/notes`
+          : `${base}/api/v4/projects/${projectPath}/merge_requests/${number}/notes/${commentId}`,
+      method: commentId === null ? 'POST' : 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(account.token ? { 'PRIVATE-TOKEN': account.token } : {}),
+      },
+      body: JSON.stringify({ body }),
+    })
+    assertOk(res.status, res.body, 'GitLab')
+    return parseJsonSafe<{ id: number }>(
+      res.body,
+      'GitLab',
+      commentId === null ? 'merge_requests notes 发布' : `merge_requests/${number}/notes/${commentId} 更新`,
+    ).id
   },
 }

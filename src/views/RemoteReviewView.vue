@@ -23,6 +23,7 @@ import ReviewModeModal from '../components/review/ReviewModeModal.vue'
 import { useAiReviewFlow } from '../composables/useAiReviewFlow'
 import { reviewGroupOptions, useReviewGroup } from '../composables/useReviewGroup'
 import type { AiReviewMode } from '../services/ai'
+import { buildReviewComment, findReviewComment, reviewCommentMarker } from '../services/ai/reviewComment'
 import { providers } from '../services/platforms'
 import { aiResultKey, useAiStore } from '../stores/ai'
 import { repoKey, usePrsStore } from '../stores/prs'
@@ -216,9 +217,14 @@ async function selectPr(platform: Platform, repo: string, number: number) {
 /** 详情请求序号：每次发起递增；await 返回后序号已被更新请求取代的结果一律过期丢弃 */
 let detailRequestSeq = 0
 
-async function loadDetail() {
+/** 拉取当前选中 PR 详情并写入共享 detail。返回值是「本次请求自己拉到的详情」：
+ *  过期（被更新的请求取代/选中项被清空）或失败时返回 null——调用方需要详情做后续
+ *  动作时（如发起评审）必须用返回值而非读共享 detail，否则 await 期间用户切换选中项，
+ *  共享位已是其他 PR 的详情（评审 #60 竞态）。仅刷新展示的调用方（selectPr/runPrAction）
+ *  可忽略返回值 */
+async function loadDetail(): Promise<PullRequestDetail | null> {
   const sel = selected.value
-  if (!sel) return
+  if (!sel) return null
   const requestId = ++detailRequestSeq
   detailLoading.value = true
   /** 过期判定：选中项已被清空（如移除仓库）或已有更新的详情请求发出，本次结果不得写入任何状态 */
@@ -229,12 +235,14 @@ async function loadDetail() {
       sel.repo,
       sel.number,
     )
-    if (isStale()) return
+    if (isStale()) return null
     detail.value = result
+    return result
   } catch (err) {
-    if (isStale()) return
+    if (isStale()) return null
     detail.value = null
     message.error(err instanceof Error ? err.message : String(err))
+    return null
   } finally {
     if (!isStale()) detailLoading.value = false
   }
@@ -337,10 +345,17 @@ function mergeDetail(method: MergeMethod) {
   })
 }
 
-/** 弹窗确认后真正发起远程评审 */
-function beginRemoteReview(mode: AiReviewMode) {
-  const pr = detail.value
-  if (!pr) return
+/** 弹窗确认后真正发起远程评审：先重新拉取 PR 详情再评审（评审老大 10-20：推送新代码后
+ *  点评审仍出旧报告）——detail 是选中 PR 那一刻的快照，beginReview 原样透传，平台侧
+ *  代码更新后旧 diff 会整份交给模型；拉取失败（detail 置空）则中止，不拿旧快照硬评 */
+async function beginRemoteReview(mode: AiReviewMode) {
+  const sel = selected.value
+  if (!sel) return
+  // 双重防串（评审 #60）：await 期间用户切换选中项时，①loadDetail 返回的是本次请求
+  // 自己的结果（共享 detail 可能已被其他 PR 的请求覆盖）；②返回前复核选中项身份——
+  // 用户已切走时中止，绝不以 A 的评审意图拿 B 的 diff 交给模型
+  const pr = await loadDetail()
+  if (!pr || selected.value !== sel) return
   activeTab.value = 'ai'
   aiPanels.value = ['progress']
   void aiStore.runReview(pr, mode)
@@ -391,6 +406,117 @@ function startReview(force = false) {
     return
   }
   openModeModal()
+}
+
+/** 回写评论进行中标记：与 acting 互不混用（acting 的动作会触发 loadDetail，回写不需要） */
+const writingComment = ref(false)
+
+/** 可回写 = 已选中 PR 且当前有 AI 结果（评审中/无结果时按钮隐藏，面板传参控制显隐） */
+const canWriteComment = computed(() => Boolean(selected.value && aiResult.value && !aiReviewing.value))
+
+/** 回写评审汇总评论（R2）：先拉评论列表拿真凭据 → 确认弹窗内嵌评论原文（可编辑）→ 发布/更新。
+ *  幂等：有 MergeHub 标记的旧评论原帖更新（不追加刷屏）；找不到标记（首次/被人删除）发布新评论。
+ *  弹窗预判必须有真凭据（#31 教训）：弹窗前的列表拉取提供 existingId/truncated，
+ *  发布/更新不再是二选一的含糊文案，而是精确状态；
+ *  预览可编辑（评审老大 10-19：预览不能改吗）——textarea 双向绑定，确认发出的是编辑后内容；
+ *  但首行幂等锚点受保护（readonly 首行提示 + 发出前校验）：锚点被改/删会让下次回写
+ *  找不到本条评论而重复发布，破坏幂等 */
+async function writeComment() {
+  const sel = selected.value
+  const result = aiResult.value
+  if (!sel || !result || writingComment.value) return
+  writingComment.value = true
+  let body: string
+  let existingId: number | null
+  let truncated: boolean
+  try {
+    body = buildReviewComment({
+      repo: sel.repo,
+      number: sel.number,
+      result,
+      pending: flow.pendingStats.value,
+    })
+    const provider = providers[sel.platform]
+    // truncated（评审 #42，#56 收紧为对称中止）：护栏截断且正序下截掉的是最新区间——
+    // 不仅「未检索到」不可信（发布必重复），「检索到锚点」同样不可信：命中的可能是
+    // 被截掉的更早旧帖，更新它会与截断区间内更新的汇总评论并存、产生双份汇总。
+    // 截断时无论是否定位到锚点一律中止，防重复口径对称
+    const listed = await provider.listPullRequestComments(
+      accountOf(sel.platform),
+      sel.repo,
+      sel.number,
+    )
+    truncated = listed.truncated
+    existingId = findReviewComment(listed.comments, sel.repo, sel.number)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : String(err))
+    return
+  } finally {
+    writingComment.value = false
+  }
+  if (truncated) {
+    message.error(
+      `该 PR 评论数超过翻页上限（最新区间被截断），无法确认检索到的汇总评论是否为最新；为避免重复发布或新旧并存已中止，请先到平台清理历史评论后重试`,
+    )
+    return
+  }
+  // 编辑内容用普通变量承载（#57）：Modal.confirm 的 content 是一次性静态 vnode，
+  // 不进入 Vue 渲染管线，ref 包装是死响应式——onInput 回写变量 + onOk 读变量即可，
+  // 挂 ref 反而暗示「会驱动渲染」误导维护者
+  let editableBody = body
+  const marker = reviewCommentMarker(sel.repo, sel.number)
+  Modal.confirm({
+    title: '回写评审意见到平台？',
+    content: h('div', { class: 'write-preview' }, [
+      h('div', { class: 'write-preview-meta' }, [
+        `${sel.repo} #${sel.number}（${PLATFORM_LABELS[sel.platform]}） · `,
+        existingId === null
+          ? '将发布新评论'
+          : `将更新既有汇总评论 #${existingId}`,
+      ]),
+      h('div', { class: 'write-preview-label' }, '评论内容（Markdown，可直接编辑；首行锚点保证下次不重复发布，请勿修改）：'),
+      h('textarea', {
+        class: 'write-preview-body',
+        value: editableBody,
+        onInput: (e: Event) => {
+          editableBody = (e.target as HTMLTextAreaElement).value
+        },
+        spellcheck: false,
+      }),
+    ]),
+    okText: '回写',
+    cancelText: '取消',
+    width: 640,
+    onOk: async () => {
+      // 发出前校验幂等锚点（编辑可能误删）：首行必须仍是完整标记，
+      // 否则下次回写检索不到本条 → 重复发布
+      const finalBody = editableBody
+      if (finalBody.split('\n', 1)[0] !== marker) {
+        message.error('首行幂等锚点已被修改或删除，无法保证下次不重复发布；请恢复首行原样（或撤销本次回写）')
+        return Promise.reject()
+      }
+      writingComment.value = true
+      try {
+        const provider = providers[sel.platform]
+        const commentId = await provider.upsertPullRequestComment(
+          accountOf(sel.platform),
+          sel.repo,
+          sel.number,
+          existingId,
+          finalBody,
+        )
+        message.success(
+          existingId === null
+            ? `评审意见已回写（评论 #${commentId}）`
+            : '评审意见已更新到既有汇总评论',
+        )
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : String(err))
+      } finally {
+        writingComment.value = false
+      }
+    },
+  })
 }
 </script>
 
@@ -729,6 +855,8 @@ function startReview(force = false) {
               <AiReportPanel
                 :flow="flow"
                 :start-review="startReview"
+                :write-comment="canWriteComment ? writeComment : undefined"
+                :writing-comment="writingComment"
                 empty-text="尚未对该请求进行 AI 评审"
               />
             </a-tab-pane>

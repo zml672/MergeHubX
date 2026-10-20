@@ -1,6 +1,7 @@
 import type {
   MergeMethod,
   PlatformAccount,
+  PullRequestComment,
   PullRequestDetail,
   PullRequestQuery,
   PullRequestSummary,
@@ -9,10 +10,15 @@ import { httpRequest } from '../http'
 import type { PlatformProvider } from './types'
 import {
   assertOk,
+  compareByCreatedAt,
   decodeBase64Text,
+  fetchAllComments,
   mapDiffStatus,
   MAX_REMOTE_FILE_BASE64_CHARS,
+  parseCreatedAt,
+  parseJsonSafe,
   splitRepo,
+  warnCommentTruncation,
 } from './utils'
 
 const GITEE_API = 'https://gitee.com'
@@ -69,7 +75,7 @@ export const giteeProvider: PlatformProvider = {
         : undefined,
     })
     assertOk(res.status, res.body, 'Gitee')
-    const user = JSON.parse(res.body) as { login?: string }
+    const user = parseJsonSafe<{ login?: string }>(res.body, 'Gitee', 'user')
     return user.login ?? ''
   },
 
@@ -85,7 +91,7 @@ export const giteeProvider: PlatformProvider = {
         : undefined,
     })
     assertOk(res.status, res.body, 'Gitee')
-    const pulls = JSON.parse(res.body) as GiteePull[]
+    const pulls = parseJsonSafe<GiteePull[]>(res.body, 'Gitee', 'pulls 列表')
     return pulls.map((p) => ({
       key: `gitee-${p.base.repo?.full_name ?? query.repo}#${p.number}`,
       platform: 'gitee',
@@ -120,13 +126,21 @@ export const giteeProvider: PlatformProvider = {
       headers,
     })
     assertOk(pullRes.status, pullRes.body, 'Gitee')
-    const p = JSON.parse(pullRes.body) as GiteePullDetail
+    const p = parseJsonSafe<GiteePullDetail>(
+      pullRes.body,
+      'Gitee',
+      `pulls/${number} 详情`,
+    )
     const filesRes = await httpRequest({
       url: `${GITEE_API}/api/v5/repos/${owner}/${name}/pulls/${number}/files`,
       headers,
     })
     assertOk(filesRes.status, filesRes.body, 'Gitee')
-    const rawFiles = JSON.parse(filesRes.body) as GiteeFile[]
+    const rawFiles = parseJsonSafe<GiteeFile[]>(
+      filesRes.body,
+      'Gitee',
+      `pulls/${number}/files`,
+    )
     return {
       key: `gitee-${p.base.repo?.full_name ?? repo}#${p.number}`,
       platform: 'gitee',
@@ -228,10 +242,11 @@ export const giteeProvider: PlatformProvider = {
         : undefined,
     })
     assertOk(res.status, res.body, 'Gitee')
-    const payload = JSON.parse(res.body) as {
-      content?: string | null
-      encoding?: string
-    }
+    const payload = parseJsonSafe<{ content?: string | null; encoding?: string }>(
+      res.body,
+      'Gitee',
+      `contents/${path}`,
+    )
     // 仅校验编码类型：空文件的 content 为空串是合法返回，应解码为空文本而非误判「内容不可用」（否则该文件被静默跳过复核）
     if (payload.encoding !== 'base64') {
       throw new Error(`Gitee 文件内容不可用：${path}`)
@@ -244,5 +259,85 @@ export const giteeProvider: PlatformProvider = {
       )
     }
     return decodeBase64Text(content)
+  },
+
+  // Gitee 的 PR 评论是独立 API（/pulls/{n}/comments），与 GitHub 的 issue comments 不同源；
+  // 编辑端点不带 PR 号（/pulls/comments/{id}）。不带 sort/direction 参数（评审 #41：go-gitee
+  // SDK 定义里该接口仅有 access_token/page/per_page，官方 issue I3OM79 请求排序参数至今未
+  // 实现——传了也是无效参数，正序全量靠下方 created_at 排序兜底保证）。
+  // base 经 account.baseUrl 兜底（评审 #30：与其余两平台行为对齐）——设置页虽未提供 Gitee
+  // baseUrl 入口（产品语义：Gitee 无自建实例），但账号数据结构三平台一致，防御脏值残留。
+  // 循环骨架/护栏/告警统一走 utils.fetchAllComments（评审 #59）
+  async listPullRequestComments(
+    account: PlatformAccount,
+    repo: string,
+    number: number,
+  ): Promise<{ comments: PullRequestComment[]; truncated: boolean }> {
+    const [owner, name] = splitRepo(repo)
+    const base = (account.baseUrl || GITEE_API).replace(/\/+$/, '')
+    const endpoint = `${base}/api/v5/repos/${owner}/${name}/pulls/${number}/comments`
+    const { items, truncated } = await fetchAllComments<{
+      id: number
+      body: string
+      created_at?: string
+    }>({
+      // 条数驱动：items.length < 100 即末页（done）；满页时平台必可翻下一页（hasNext）
+      fetchPage: async (page) => {
+        const res = await httpRequest({
+          url: `${endpoint}?per_page=100&page=${page}`,
+          headers: account.token
+            ? { Authorization: `Bearer ${account.token}` }
+            : undefined,
+        })
+        assertOk(res.status, res.body, 'Gitee')
+        const pageItems = parseJsonSafe<
+          {
+            id: number
+            body: string
+            created_at?: string
+          }[]
+        >(res.body, 'Gitee', `${endpoint}?per_page=100&page=${page}`)
+        return { items: pageItems, done: pageItems.length < 100, hasNext: pageItems.length >= 100 }
+      },
+      onTruncated: (fetchedCount) => warnCommentTruncation('gitee', repo, number, fetchedCount),
+    })
+    const comments = items.map((c) => ({
+      id: c.id,
+      body: c.body,
+      createdAt: parseCreatedAt(c.created_at),
+    }))
+    // created_at 升序排序兜底（评审 #41）：该接口无排序参数（见上），「最新评论在末页」
+    // 完全依赖本地归一；缺失/非法时间戳视作最旧排最前（评审 #48）
+    comments.sort(compareByCreatedAt)
+    return { comments, truncated }
+  },
+
+  async upsertPullRequestComment(
+    account: PlatformAccount,
+    repo: string,
+    number: number,
+    commentId: number | null,
+    body: string,
+  ): Promise<number> {
+    const [owner, name] = splitRepo(repo)
+    const base = (account.baseUrl || GITEE_API).replace(/\/+$/, '')
+    const res = await httpRequest({
+      url:
+        commentId === null
+          ? `${base}/api/v5/repos/${owner}/${name}/pulls/${number}/comments`
+          : `${base}/api/v5/repos/${owner}/${name}/pulls/comments/${commentId}`,
+      method: commentId === null ? 'POST' : 'PATCH',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...(account.token ? { Authorization: `Bearer ${account.token}` } : {}),
+      },
+      body: new URLSearchParams({ body }).toString(),
+    })
+    assertOk(res.status, res.body, 'Gitee')
+    return parseJsonSafe<{ id: number }>(
+      res.body,
+      'Gitee',
+      commentId === null ? 'pulls comments 发布' : `pulls/comments/${commentId} 更新`,
+    ).id
   },
 }

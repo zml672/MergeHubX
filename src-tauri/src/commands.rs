@@ -81,7 +81,11 @@ pub async fn http_request(options: HttpOptions) -> Result<HttpResult, String> {
 
     let mut request = client
         .request(method, &options.url)
-        .header("User-Agent", USER_AGENT);
+        .header("User-Agent", USER_AGENT)
+        // 禁缓存（评审老大 10-20：推送新代码后刷新仍见旧数据）——reqwest 自身无缓存，
+        // 但系统代理（本地 7890 等中间层）可能缓存带 ETag 的 API 响应返回陈旧 304/正文；
+        // API 客户端场景一律要求源站新鲜数据，Cache-Control 只对 GET 有意义、写操作忽略
+        .header("Cache-Control", "no-cache");
 
     if let Some(headers) = &options.headers {
         for (name, value) in headers {
@@ -215,7 +219,9 @@ pub async fn http_request_stream(
 
     let mut request = client
         .request(method, &options.url)
-        .header("User-Agent", USER_AGENT);
+        .header("User-Agent", USER_AGENT)
+        // 禁缓存：与非流式 http_request 同款理由（代理层可能缓存 ETag 响应返回陈旧数据）
+        .header("Cache-Control", "no-cache");
 
     if let Some(headers) = &options.headers {
         for (name, value) in headers {

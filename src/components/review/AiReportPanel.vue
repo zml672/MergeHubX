@@ -4,6 +4,7 @@ import { Empty } from 'ant-design-vue'
 import { useRouter } from 'vue-router'
 import {
   AuditOutlined,
+  CloudUploadOutlined,
   DownOutlined,
   DownloadOutlined,
   MoreOutlined,
@@ -25,6 +26,10 @@ const props = defineProps<{
   startReview: (force?: boolean) => void
   /** 空状态文案：本地=仓库口径，远程=请求口径 */
   emptyText: string
+  /** 回写评审评论（R2，远程视图注入）：缺省（本地视图/评审中/无结果）时隐藏按钮 */
+  writeComment?: () => void
+  /** 回写请求进行中：按钮转 loading */
+  writingComment?: boolean
 }>()
 
 const {
@@ -276,6 +281,15 @@ function confirmGovern() {
                 核验规范{{ aiResult.ruleSetName ? `「${aiResult.ruleSetName}」` : '' }} {{ aiResult.ruleCount }} 条 · 模型 {{ aiResult.model }}
               </span>
               <span class="ai-report-actions">
+                <a-button
+                  v-if="props.writeComment"
+                  size="small"
+                  :loading="props.writingComment ?? false"
+                  @click="props.writeComment"
+                >
+                  <template #icon><CloudUploadOutlined /></template>
+                  回写评论
+                </a-button>
                 <a-button size="small" @click="exportMarkdown">
                   <template #icon><DownloadOutlined /></template>
                   导出 Markdown

@@ -4,6 +4,7 @@ import { save } from '@tauri-apps/plugin-dialog'
 import { writeTextFile } from '@tauri-apps/plugin-fs'
 import { AI_ISSUE_TYPE_META, AI_RISK_META, AI_SEVERITY_META } from '../types/ai'
 import type { AiIssue, AiIssueSeverity } from '../types/ai'
+import { mdNestedIndent } from '../services/platforms/utils'
 import {
   PREV_STATUS_META,
   SEVERITY_WEIGHT,
@@ -95,11 +96,14 @@ export function useReviewExport(flow: AiReviewFlow) {
         lines.push(`### ${file}（严重 ${count('high')} · 一般 ${count('medium')} · 轻微 ${count('low')}）`, '')
         group.forEach((issue, index) => {
           const exempt = flow.recordOf(issue)?.disposition === 'exempt' ? '［已豁免］' : ''
+          // 嵌套缩进单源化（#49 族 C 收口）：公式收编至 utils.mdNestedIndent，
+          // 与 reviewComment.issueLines 共用一份，杜绝平行实现再漂移
+          const indent = mdNestedIndent(index + 1)
           lines.push(
             `${index + 1}. **[${AI_SEVERITY_META[issue.severity].label}·${AI_ISSUE_TYPE_META[issue.type].label}]**${exempt} \`${issue.file}:${issue.line}\``,
-            `   - 问题：${mdCell(issue.comment)}`,
+            `${indent}- 问题：${mdCell(issue.comment)}`,
           )
-          if (issue.suggestion) lines.push(`   - 建议：${mdCell(issue.suggestion)}`)
+          if (issue.suggestion) lines.push(`${indent}- 建议：${mdCell(issue.suggestion)}`)
         })
         lines.push('')
       }
