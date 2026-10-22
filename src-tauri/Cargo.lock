@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "mergehub"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "keyring",
  "reqwest 0.12.28",
