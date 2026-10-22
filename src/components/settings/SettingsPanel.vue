@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
 import AiModels from './AiModels.vue'
+import AppUpdate from './AppUpdate.vue'
 import LocalGitPrefs from './LocalGitPrefs.vue'
 import PlatformAccounts from './PlatformAccounts.vue'
 import { useUiStore } from '../../stores/ui'
@@ -31,6 +32,9 @@ function goGovernance(): void {
     </a-tab-pane>
     <a-tab-pane key="local" tab="本地仓库">
       <LocalGitPrefs />
+    </a-tab-pane>
+    <a-tab-pane key="about" tab="关于">
+      <AppUpdate />
     </a-tab-pane>
   </a-tabs>
 </template>

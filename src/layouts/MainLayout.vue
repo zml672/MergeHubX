@@ -66,6 +66,26 @@ function go(key: string) {
           </button>
         </nav>
       <a-tag color="blue" class="mode-tag">形态 A · 纯客户端</a-tag>
+      <!-- R5 启动静默检查发现新版：横幅提示，点击直达设置「关于」Tab（检查/安装都在那里）；
+           「忽略」释放 Update 并消除横幅（评审三轮：横幅是唯一入口且无法消除，用户暂时不想升级时得能关掉） -->
+      <div v-if="ui.startupUpdate" class="update-banner">
+        <button
+          type="button"
+          class="update-banner-go"
+          @click="ui.openSettings('about')"
+        >
+          🚀 新版本 v{{ ui.startupUpdate.version }} 可用，点击前往更新
+        </button>
+        <button
+          type="button"
+          class="update-banner-dismiss"
+          aria-label="忽略此更新"
+          title="忽略此更新"
+          @click="ui.dismissStartupUpdate()"
+        >
+          ✕
+        </button>
+      </div>
     </a-layout-header>
     <a-layout-content class="app-content">
       <!-- 审阅页路由级保活：切换到其他页面再回来时组件不销毁，进行中的 AI 任务与未提交的编辑状态得以保留 -->
@@ -187,6 +207,45 @@ function go(key: string) {
 
 .mode-tag {
   flex-shrink: 0;
+}
+
+.update-banner {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #ffd591;
+  background: #fffbe6;
+  color: #874d00;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.update-banner-go {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  padding: 2px 4px 2px 10px;
+  cursor: pointer;
+}
+
+.update-banner-go:hover {
+  text-decoration: underline;
+}
+
+.update-banner-dismiss {
+  border: none;
+  background: transparent;
+  color: rgba(135, 77, 0, 0.65);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 8px 2px 4px;
+  cursor: pointer;
+}
+
+.update-banner-dismiss:hover {
+  color: #874d00;
 }
 
 .app-content {

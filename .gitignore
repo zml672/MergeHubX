@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# 本地文档笔记目录（仅根目录；评审 10-22：裸 docs 会误伤任意层级的同名目录）
+/docs/
+
 # WebView 运行时缓存（Tauri/WebView2 本地数据，与代码无关）
 .webview-data/
 

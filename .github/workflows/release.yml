@@ -45,9 +45,14 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # updater 签名私钥（仓库 Secrets 配置）；无密码密钥时 PASSWORD 留空即等价未设置
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tagName || github.ref_name }}
           releaseName: ${{ github.event_name == 'workflow_dispatch' && inputs.tagName || github.ref_name }}
+          # Windows 同时产出 NSIS 与 MSI，latest.json 只能指向其一——按前端挑选顺序优先 NSIS
+          updaterJsonPreferNsis: true
           releaseBody: |
             桌面端安装包见下方 Assets。
 

@@ -7,8 +7,29 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // 显式标注 Wry：Context::config() 带 Runtime 泛型约束，宏展开类型需单一路径可推断
+    let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+    // updater 插件强制要求 plugins.updater 配置且 pubkey 必填（无默认值），缺失时插件
+    // 初始化直接 panic（10-22 移除占位配置后 dev 启动复现，exit 101）。
+    // 评审五轮：仅判 "updater" 键存在不够——配置对象存在但 pubkey 缺失/为空时仍会 panic，
+    // 故校验 pubkey 为非空字符串后才有条件注册；真公钥配置就位后自动启用，Rust 侧无需再改。
+    let updater_configured = context
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|v| v.get("pubkey"))
+        .and_then(|p| p.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    let builder = if updater_configured {
+        tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build())
+    } else {
+        tauri::Builder::default()
+    };
+    builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
@@ -48,6 +69,7 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
+        // 复用开头构建的 Context（评审 10-22 二轮：重复 generate_context! 白做一次资源解析）
+        .run(context)
         .expect("error while running tauri application");
 }
