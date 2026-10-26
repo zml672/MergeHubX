@@ -160,3 +160,157 @@ describe('previousChecks 去重与 riskLevel 校准', () => {
     expect(merged.result.riskLevel).toBe('high')
   })
 })
+
+describe('核对结论按行号证据取信（重复报错根治）', () => {
+  /** 复现场景：storage.ts 上轮报了 line=540 的问题；本轮 diff 切两段，
+   *  批一只含前段（1-300 行），批二含尾段（含 540 行）。批一盲猜 not_fixed，
+   *  批二亲眼核对 fixed——修复结论必须胜出，否则已修复问题被无限重报 */
+  const coverage: Parameters<typeof mergeResults>[6] = [
+    { ranges: new Map([['storage.ts', [[1, 300] as [number, number]]]]) },
+    { ranges: new Map([['storage.ts', [[301, 600] as [number, number]]]]) },
+  ]
+  const blindView: AiPreviousCheck = {
+    file: 'storage.ts',
+    line: 540,
+    severity: 'high',
+    type: 'bug',
+    comment: '指针切换后尾段目录未建',
+    status: 'not_fixed',
+    note: '本批次 diff 未包含尾段',
+  }
+  const evidenceView: AiPreviousCheck = {
+    ...blindView,
+    status: 'fixed',
+    note: '已确认修复',
+  }
+
+  it('覆盖批次 fixed 压过盲批 not_fixed：修复结论不再被悲观覆盖', async () => {
+    vi.mocked(chatCompletionStream).mockResolvedValue({
+      content: '合成后的总评',
+      answerChars: 6,
+      reasoningChars: 0,
+      usage: undefined,
+    })
+    const blind: AiReviewResult = { ...batchResult('批一'), previousChecks: [blindView] }
+    const evidence: AiReviewResult = { ...batchResult('批二'), previousChecks: [evidenceView] }
+    const merged = await mergeResults(config, [blind, evidence], undefined, undefined, undefined, undefined, coverage)
+    expect(merged.result.previousChecks).toHaveLength(1)
+    expect(merged.result.previousChecks![0].status).toBe('fixed')
+    // 闭环不派生：fixed 不是补入条件，已修复问题不再回灌问题清单
+    expect(merged.result.issues.some((i) => i.comment === '指针切换后尾段目录未建')).toBe(false)
+  })
+
+  it('证据同级（双盲）：退回悲观策略，未修复结论不被乐观掩盖', async () => {
+    vi.mocked(chatCompletionStream).mockResolvedValue({
+      content: '合成后的总评',
+      answerChars: 6,
+      reasoningChars: 0,
+      usage: undefined,
+    })
+    // 两批都覆盖不到 540 行（各自只看到 1-300、301-500 之外的前段），双双盲猜——保留更悲观的
+    const bothBlind: Parameters<typeof mergeResults>[6] = [
+      { ranges: new Map([['storage.ts', [[1, 300] as [number, number]]]]) },
+      { ranges: new Map([['storage.ts', [[301, 500] as [number, number]]]]) },
+    ]
+    const notFixed: AiReviewResult = { ...batchResult('批一'), previousChecks: [blindView] }
+    const optimistic: AiReviewResult = { ...batchResult('批二'), previousChecks: [evidenceView] }
+    const merged = await mergeResults(config, [notFixed, optimistic], undefined, undefined, undefined, undefined, bothBlind)
+    expect(merged.result.previousChecks![0].status).toBe('not_fixed')
+    expect(merged.result.issues.some((i) => i.comment === '指针切换后尾段目录未建')).toBe(true)
+  })
+
+  it('不传 coverage：行为与旧版完全一致（纯悲观去重）', async () => {
+    vi.mocked(chatCompletionStream).mockResolvedValue({
+      content: '合成后的总评',
+      answerChars: 6,
+      reasoningChars: 0,
+      usage: undefined,
+    })
+    const fixed: AiReviewResult = { ...batchResult('批一'), previousChecks: [evidenceView] }
+    const blind: AiReviewResult = { ...batchResult('批二'), previousChecks: [blindView] }
+    const merged = await mergeResults(config, [fixed, blind], undefined, undefined)
+    expect(merged.result.previousChecks![0].status).toBe('not_fixed')
+  })
+
+  it('line=0 文件级结论视为有证据：任意批次均可判，同级冲突退回悲观', async () => {
+    vi.mocked(chatCompletionStream).mockResolvedValue({
+      content: '合成后的总评',
+      answerChars: 6,
+      reasoningChars: 0,
+      usage: undefined,
+    })
+    const fileLevelBase = { file: 'storage.ts', line: 0, severity: 'medium' as const, type: 'bug' as const, comment: '文件级：错误处理不一致' }
+    const batchA: AiReviewResult = {
+      ...batchResult('批一'),
+      previousChecks: [{ ...fileLevelBase, status: 'fixed', note: '已统一' }],
+    }
+    const batchB: AiReviewResult = {
+      ...batchResult('批二'),
+      previousChecks: [{ ...fileLevelBase, status: 'not_fixed', note: '仍不一致' }],
+    }
+    const merged = await mergeResults(config, [batchA, batchB], undefined, undefined, undefined, undefined, coverage)
+    expect(merged.result.previousChecks![0].status).toBe('not_fixed')
+  })
+
+  it('清单外回显（模型越权核对未下发文件）：无依据结论不得压过有证据批次的修复结论', async () => {
+    vi.mocked(chatCompletionStream).mockResolvedValue({
+      content: '合成后的总评',
+      answerChars: 6,
+      reasoningChars: 0,
+      usage: undefined,
+    })
+    // 批 1 只覆盖 a.ts（b.ts 的问题清单未下发给它），批 2 覆盖 b.ts。
+    // 模型未遵守「只核对下发清单」约束，在批 1 越权回显了 b.ts 的 not_fixed；
+    // 批 2 拿到下发清单、真实核对出 fixed。取信必须与分发对称：
+    // 文件不在本批覆盖索引 = 无依据，回显的盲猜不得压过有真实依据的 fixed
+    const splitCoverage: Parameters<typeof mergeResults>[6] = [
+      { ranges: new Map([['a.ts', [[1, 100] as [number, number]]]]) },
+      { ranges: new Map([['b.ts', [[1, 100] as [number, number]]]]) },
+    ]
+    const echoBack: AiPreviousCheck = {
+      file: 'b.ts',
+      line: 50,
+      severity: 'high',
+      type: 'bug',
+      comment: '指针切换后尾段目录未建',
+      status: 'not_fixed',
+      note: '清单外回显：本批次 diff 未包含该文件',
+    }
+    const realVerdict: AiPreviousCheck = { ...echoBack, status: 'fixed', note: '已确认修复' }
+    const violator: AiReviewResult = { ...batchResult('批一'), previousChecks: [echoBack] }
+    const honest: AiReviewResult = { ...batchResult('批二'), previousChecks: [realVerdict] }
+    const merged = await mergeResults(config, [violator, honest], undefined, undefined, undefined, undefined, splitCoverage)
+    expect(merged.result.previousChecks![0].status).toBe('fixed')
+    expect(merged.result.issues.some((i) => i.comment === '指针切换后尾段目录未建')).toBe(false)
+  })
+
+  it('清单外回显 line=0 文件级结论：同样无依据，不得压过覆盖批次的 fixed', async () => {
+    vi.mocked(chatCompletionStream).mockResolvedValue({
+      content: '合成后的总评',
+      answerChars: 6,
+      reasoningChars: 0,
+      usage: undefined,
+    })
+    // line=0 分支残留：文件级结论无位置锚点，但「文件不在本批」的拦截必须优先——
+    // 分发端规则④对 line=0 同样「不在不发给」，取信端必须对称
+    const splitCoverage: Parameters<typeof mergeResults>[6] = [
+      { ranges: new Map([['a.ts', [[1, 100] as [number, number]]]]) },
+      { ranges: new Map([['b.ts', [[1, 100] as [number, number]]]]) },
+    ]
+    const echoFileLevel: AiPreviousCheck = {
+      file: 'b.ts',
+      line: 0,
+      severity: 'medium',
+      type: 'bug',
+      comment: '文件级：错误处理不一致',
+      status: 'not_fixed',
+      note: '清单外回显',
+    }
+    const realFileLevel: AiPreviousCheck = { ...echoFileLevel, status: 'fixed', note: '已核对统一' }
+    const violator: AiReviewResult = { ...batchResult('批一'), previousChecks: [echoFileLevel] }
+    const honest: AiReviewResult = { ...batchResult('批二'), previousChecks: [realFileLevel] }
+    const merged = await mergeResults(config, [violator, honest], undefined, undefined, undefined, undefined, splitCoverage)
+    expect(merged.result.previousChecks![0].status).toBe('fixed')
+    expect(merged.result.issues.some((i) => i.comment === '文件级：错误处理不一致')).toBe(false)
+  })
+})

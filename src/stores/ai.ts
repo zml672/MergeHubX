@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { buildBatchPlan, buildResumeFingerprint, isReviewCancelled, reviewPullRequest } from '../services/ai'
 import type { AiReviewEvent, AiReviewMode, FileContentFetcher, ReviewCancelHandle } from '../services/ai'
 import { httpStreamCancel } from '../services/http'
+import { beginConversationBatch } from '../services/aiDebugLog'
 import { readLocalFile } from '../services/local/git'
 import { providers } from '../services/platforms'
 import { deleteSecret, getSecret, setSecret } from '../services/secret'
@@ -730,6 +731,10 @@ export const useAiStore = defineStore('ai', {
               ]),
             )
           : new Map<number, AiReviewResult>()
+      // P1-17：每次评审开启新的对话批次——本批全部请求/响应块进同一个
+      // conversations/{yyyyMMddHHmmss}.log（续跑 resume 不开新文件，接续同批）。
+      // 放在 configReady 等早退校验之后：未真正发起评审不产生空批次日志文件
+      if (!resume) beginConversationBatch()
       const requestId = generateRequestId()
       // streamIds：在途流式请求的线束 id 集合（client.ts 发流登记/settle 注销），stopReview 逐条取消——
       // 评审并发多条流（多批次 + 复核 + 总评）各自在 Rust 注册表有独立 token，停止按钮可全量命中

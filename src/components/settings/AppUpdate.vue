@@ -76,7 +76,10 @@ type UpdaterCheckResult =
 
 async function tryUpdaterCheck(): Promise<UpdaterCheckResult> {
   try {
-    const update = await check({ timeout: 15000 })
+    // 经 ui store 的 in-flight 共享通道（评审四轮）：启动静默检查与手动检查共用，
+    // 在飞时复用同一 Promise，不并发重复请求。启动侧发现更新时会写 ui.startupUpdate，
+    // 本组件 onMounted 已有消费逻辑接管该对象，此处只需拿到 check 结果
+    const update = await ui.runExclusiveUpdaterCheck(() => check({ timeout: 15000 }))
     return update ? { state: 'update', update } : { state: 'none' }
   } catch {
     return { state: 'unavailable' }

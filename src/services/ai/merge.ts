@@ -2,6 +2,7 @@
 
 import { chatCompletionStream, isReviewCancelled } from './client'
 import type { ReviewCancelHandle, TokenUsage } from './client'
+import type { BatchCoverage } from './batching'
 import { issueFingerprint } from '../../utils/issueFingerprint'
 import { logAiError } from '../aiDebugLog'
 import type {
@@ -229,21 +230,58 @@ function sortPreviousChecks(checks: AiPreviousCheck[]): AiPreviousCheck[] {
   })
 }
 
-/** 跨批核对结论去重 + 排序：大文件跨批时同一文件的上轮清单会随批次重复下发/返回，
- *  不去重则报告对比清单出现成倍重复条目。身份键与闭环/角标同口径（issueFingerprint，
- *  行号不参与）。冲突时保留更悲观的结论（not_fixed > partial > fixed）：仅覆盖该问题
- *  所在范围的批次有真实依据，靠前批次的乐观 fixed 会掩盖实际未修复，绕过闭环补入；
- *  保守结论的代价只是对比清单显示偏悲观，漏报的代价是真实问题缺席 */
-function compactPreviousChecks(checks: AiPreviousCheck[]): AiPreviousCheck[] | undefined {
-  if (checks.length === 0) return undefined
+/** 批次对某条核对结论是否有行号证据（与 previousIssuesForBatch 分发语义对称）：
+ *  键不存在（该文件不在本批覆盖索引）= 问题清单未下发给该批，任何结论——含 line=0
+ *  文件级——只能产生于模型越权回显 → 无证据（此判定必须先于 line<=0 分支，否则
+ *  文件级结论绕过键存在性拦截，恰是误覆盖路径的残留缝）；空数组（键存在但无行号
+ *  覆盖信息，如纯删除文件）= 整文件语义可判 → 有证据；line=0 → 有证据；
+ *  命中行号区间 → 有证据 */
+function checkHasEvidence(ranges: [number, number][] | undefined, check: AiPreviousCheck): boolean {
+  if (ranges === undefined) return false
+  if (check.line <= 0) return true
+  if (ranges.length === 0) return true
+  return ranges.some(([from, to]) => check.line >= from && check.line <= to)
+}
+
+/**
+ * 跨批核对结论去重 + 排序（纯函数）：同一核对结论（issueFingerprint 同键，行号不参与）
+ * 可能被多个批次重复返回，不去重则对比清单成倍重复。
+ * 冲突采信（B 方案）：perBatchChecks 与 coverage 按批次下标配对时，优先保留「该批次 diff
+ * 真正覆盖问题所在行号」的结论——覆盖批次亲眼见过问题现场，未覆盖批次的 not_fixed 只能
+ * 产生于盲猜（正是此前五轮重复报错的机制根源）。证据同级（都覆盖或都不覆盖）时退回
+ * 悲观策略（not_fixed > partial > fixed）兜底；coverage 不传 = 旧语义（纯悲观），
+ * 单批路径与既有测试零行为变化
+ */
+function compactPreviousChecks(
+  perBatchChecks: AiPreviousCheck[][],
+  coverage?: BatchCoverage[],
+): AiPreviousCheck[] | undefined {
   const seen = new Map<string, AiPreviousCheck>()
-  for (const check of checks) {
-    const key = issueFingerprint(check)
-    const existing = seen.get(key)
-    if (!existing || PREV_STATUS_RANK[check.status] < PREV_STATUS_RANK[existing.status]) {
-      seen.set(key, check)
+  const evidenced = new Set<string>()
+  perBatchChecks.forEach((checks, batchIdx) => {
+    const batchRanges = coverage?.[batchIdx]?.ranges
+    for (const check of checks) {
+      const key = issueFingerprint(check)
+      const hasEvidence = checkHasEvidence(batchRanges?.get(check.file), check)
+      const existing = seen.get(key)
+      if (!existing) {
+        seen.set(key, check)
+        if (hasEvidence) evidenced.add(key)
+        continue
+      }
+      if (hasEvidence && !evidenced.has(key)) {
+        // 有证据结论替换无证据结论：证据优先级高于状态悲观度
+        seen.set(key, check)
+        evidenced.add(key)
+        continue
+      }
+      // 证据同级（都覆盖或都不覆盖）：维持悲观策略（not_fixed > partial > fixed）
+      if (hasEvidence === evidenced.has(key) && PREV_STATUS_RANK[check.status] < PREV_STATUS_RANK[existing.status]) {
+        seen.set(key, check)
+      }
     }
-  }
+  })
+  if (seen.size === 0) return undefined
   return sortPreviousChecks([...seen.values()])
 }
 
@@ -343,6 +381,9 @@ async function mergeResults(
   onEvent: AiReviewListener | undefined,
   cancel?: ReviewCancelHandle,
   logDir?: string,
+  /** 各批次行号覆盖索引（engine 按 plan 顺序构建）：与 results 下标配对，供核对结论按证据取信。
+   *  不传 = 旧悲观语义（兼容断点续跑等未构建覆盖的场景） */
+  coverage?: BatchCoverage[],
 ): Promise<BatchOutcome> {
   if (results.length === 1) {
     const issues = closeIssueLoop(
@@ -354,7 +395,10 @@ async function mergeResults(
         ...results[0],
         issues,
         riskLevel: calibratedRiskLevel(results[0].riskLevel, issues),
-        previousChecks: compactPreviousChecks(results[0].previousChecks ?? []),
+        previousChecks: compactPreviousChecks(
+          [(results[0].previousChecks ?? []).slice()],
+          coverage ? [coverage[0]] : undefined,
+        ),
         comparedWith: results[0].previousChecks?.length ? previous?.reviewedAt : undefined,
       },
       answerChars: 0,
@@ -400,7 +444,10 @@ async function mergeResults(
     synthesisFailed = true
     summary = results.map((r, i) => `【批次${i + 1}】${r.summary}`).join('\n')
   }
-  const previousChecks = compactPreviousChecks(results.flatMap((r) => r.previousChecks ?? []))
+  const previousChecks = compactPreviousChecks(
+    results.map((r) => r.previousChecks ?? []),
+    coverage,
+  )
   const finalIssues = closeIssueLoop(issues, previousChecks ?? [])
   return {
     result: {

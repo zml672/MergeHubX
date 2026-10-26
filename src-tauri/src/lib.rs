@@ -1,5 +1,6 @@
 mod commands;
 mod git;
+mod storage;
 
 use std::path::PathBuf;
 
@@ -42,6 +43,15 @@ pub fn run() {
             commands::append_ai_debug_log,
             commands::open_ai_log_dir,
             commands::open_local_folder,
+            storage::storage_read,
+            storage::storage_write,
+            storage::storage_remove,
+            storage::storage_append,
+            storage::storage_remove_dir,
+            storage::storage_list_dirs,
+            storage::data_root_info,
+            storage::data_root_set,
+            storage::data_dir_open,
             git::git_repo_info,
             git::git_diff,
             git::git_commit,

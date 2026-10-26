@@ -19,11 +19,36 @@ interface AiLogAppendResult {
   dirPath: string
 }
 
-/** 生成当天日志文件名：yyyy-MM-dd.log（按仓库每天一份） */
-function todayLogName(): string {
+/**
+ * 当前评审批次的对话文件名（yyyyMMddHHmmss-xxxx.log）。
+ * P1-17：对话按「一次评审一个文件」组织在仓库的 conversations/ 下，同一批次内
+ * 全部场景（分片评审/合并复审/验证）的请求块、响应块、错误块按时间序列追加进
+ * 同一文件。批次由首次写入时建立，此后整个评审过程复用。
+ */
+let currentBatchFile: string | null = null
+
+/** 批次文件名单源构造器：14 位时间戳 + '-' + 8 位 hex + '.log'（共 27 字符）。
+ *  该格式是 Rust 侧 append_ai_debug_log 的硬校验契约（commands.rs 按 len==27 &&
+ *  ends_with('.log') && 分段字符集校验，不匹配整条写入被拒），主路径与兜底路径
+ *  必须共用本函数——七轮评审实证：兜底分支曾只拼 batchTimestamp()+' .log'（18 字符）
+ *  仍被拒，格式契约散落在两处就会再漂移 */
+function makeBatchFileName(): string {
+  return `${batchTimestamp()}-${shortHash(String(Date.now()) + String(Math.random()))}.log`
+}
+
+/** 评审批次开始：新评审发起时调用，开启新的对话文件 */
+export function beginConversationBatch(): void {
+  currentBatchFile = makeBatchFileName()
+}
+
+/** 批次时间戳：yyyyMMddHHmmss（本地时间，文件名即时间序列） */
+function batchTimestamp(): string {
   const d = new Date()
   const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.log`
+  return (
+    `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+  )
 }
 
 /** FNV-1a 32 位短哈希（8 位十六进制，同步无依赖）：目录名唯一性后缀，不同标识即使可读前缀相同也由哈希区分；另供断点指纹对分片内容做轻量摘要（等长修改也会改变哈希） */
@@ -55,12 +80,18 @@ function fmtTime(at: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-/** 追加写入日志文件（fire-and-forget：失败静默，不影响评审主流程） */
+/** 追加写入日志文件（fire-and-forget：失败静默，不影响评审主流程）。
+ *  P1-17：repo 标识即数据目录内的仓库文件夹名（append_ai_debug_log 在其中建
+ *  conversations/ 子目录），对话与评审数据同处一个仓库文件夹。
+ *  批次兜底仅临时生成：不写回 currentBatchFile——否则某次未 begin 的评审会让
+ *  此后所有评审（甚至跨天）追加进同一个文件，形成无法按批次定位的巨型日志 */
 function appendLog(repo: string, block: string): void {
   if (!repo) return
+  // 兜底走同一构造器：格式契约（27 字符）单源，见 makeBatchFileName 注释
+  const batchFile = currentBatchFile ?? makeBatchFileName()
   invoke<AiLogAppendResult>('append_ai_debug_log', {
     repo,
-    fileName: todayLogName(),
+    fileName: batchFile,
     content: block,
   })
     .then((r) => {

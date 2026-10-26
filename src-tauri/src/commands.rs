@@ -398,7 +398,10 @@ pub struct AiLogAppendResult {
     pub dir_path: String,
 }
 
-/// 追加一段 AI 调试日志：按仓库分目录、按日期分文件，写入前循环清除超期日志
+/// 追加一段 AI 调试日志（P1-17）：按仓库分目录、按评审批次分文件
+/// （yyyyMMddHHmmss-xxxxxxxx.log，同一批次内请求/响应/错误块按时间序列追加；
+/// -后 8 位十六进制唯一后缀防同秒两批评审混写），
+/// 对话文件归入仓库文件夹的 conversations/ 子目录，写入前循环清除超期日志
 #[tauri::command]
 pub async fn append_ai_debug_log(
     app: tauri::AppHandle,
@@ -407,14 +410,17 @@ pub async fn append_ai_debug_log(
     content: String,
 ) -> Result<AiLogAppendResult, String> {
     let bytes = file_name.as_bytes();
-    let valid = bytes.len() == 14
+    // 格式：14 位时间戳 + '-' + 8 位十六进制 + ".log"（共 27 字符）
+    let valid = bytes.len() == 27
         && file_name.ends_with(".log")
-        && bytes[..10].iter().all(|b| b.is_ascii_digit() || *b == b'-');
+        && bytes[..14].iter().all(|b| b.is_ascii_digit())
+        && bytes[14] == b'-'
+        && bytes[15..23].iter().all(|b| b.is_ascii_hexdigit());
     if !valid {
-        return Err("非法的日志文件名，应为 yyyy-MM-dd.log".to_string());
+        return Err("非法的日志文件名，应为 yyyyMMddHHmmss-xxxxxxxx.log".to_string());
     }
 
-    let dir = ai_log_dir(&app, &repo)?;
+    let dir = ai_log_dir(&app, &repo)?.join("conversations");
     fs::create_dir_all(&dir).map_err(|e| format!("无法创建日志目录：{e}"))?;
     remove_expired_logs(&dir);
 

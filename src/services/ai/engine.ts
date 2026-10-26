@@ -2,7 +2,7 @@
 
 import { chatCompletionStream, effectiveConcurrency, mergeUsage, ReviewCancelledError, isReviewCancelled } from './client'
 import type { AiReviewMode, BatchPlan } from './batching'
-import { buildBatchPlan, buildBatchPrompt, buildManifest } from './batching'
+import { buildBatchCoverage, buildBatchPlan, buildBatchPrompt, buildManifest, previousIssuesForBatch } from './batching'
 import { buildSystemPrompt } from './prompts'
 import { mergeResults, parseReviewContent } from './merge'
 import type { BatchOutcome } from './merge'
@@ -344,10 +344,13 @@ export async function reviewPullRequest(
   const manifest = buildManifest(plan)
   const multi = totalBatches > 1
   const hasPrevious = Boolean(previous && !previous.degraded && previous.issues.length > 0)
+  // 行号覆盖索引：A 清单按覆盖分发（消灭盲批核对）+ B 核对结论按证据取信，两处共用一次构建
+  const coverage = buildBatchCoverage(plan)
   const prompts: ChatMessage[][] = plan.batches.map((batch, i) => {
-    const batchPaths = new Set(batch.chunks.map((c) => c.file.path))
     const previousIssues =
-      hasPrevious && previous ? previous.issues.filter((issue) => batchPaths.has(issue.file)) : []
+      hasPrevious && previous
+        ? previousIssuesForBatch(previous.issues, coverage[i])
+        : []
     return [
       { role: 'system', content: buildSystemPrompt(multi, previousIssues.length > 0) },
       {
@@ -492,7 +495,7 @@ export async function reviewPullRequest(
     fetchFileContent ? contentCache : undefined,
     oversizedFiles,
   )
-  const merged = await mergeResults(config, results, previous, onEvent, cancel, logDir)
+  const merged = await mergeResults(config, results, previous, onEvent, cancel, logDir, coverage)
   if (verifyOutcome) merged.result.verify = verifyOutcome.stat
   if (exemptedIssues.length > 0) merged.result.exempted = { count: exemptedIssues.length, issues: exemptedIssues }
   onEvent?.({

@@ -7,7 +7,11 @@ import {
   parseReviewContent,
   parseSummaryOutput,
 } from '../ai'
-import { buildBatchPrompt } from '../ai/batching'
+import {
+  buildBatchCoverage,
+  buildBatchPrompt,
+  previousIssuesForBatch,
+} from '../ai/batching'
 import { isRetryableNetworkError } from '../ai/engine'
 import type { AiIssue, AiModelConfig, AiPreviousCheck, ReviewRule } from '../../types/ai'
 import type { DiffFile, PullRequestDetail } from '../../types/platform'
@@ -164,6 +168,8 @@ describe('buildBatchPrompt 段标记', () => {
       totalParts: 4,
       content: lines(3, String(part)[0] as 'a'),
       truncated: true,
+      newLineFrom: (part - 1) * 3 + 1,
+      newLineTo: part * 3,
     })
     const batch: Parameters<typeof buildBatchPrompt>[3] = {
       chunks: [chunkOf(3)],
@@ -182,6 +188,8 @@ describe('buildBatchPrompt 段标记', () => {
       totalParts: 1,
       content: 'line1\nline2\n',
       truncated: false,
+      newLineFrom: 1,
+      newLineTo: 2,
     }
     const batch: Parameters<typeof buildBatchPrompt>[3] = { chunks: [chunk], chars: 12 }
     const prompt = buildBatchPrompt(pr, [], manifest, batch, 0, 1, [], [])
@@ -196,6 +204,8 @@ describe('buildBatchPrompt 段标记', () => {
       totalParts: 4,
       content: `${part}\n`,
       truncated: false,
+      newLineFrom: part,
+      newLineTo: part,
     })
     const batch: Parameters<typeof buildBatchPrompt>[3] = {
       chunks: [chunkOf(2), chunkOf(1)],
@@ -206,6 +216,122 @@ describe('buildBatchPrompt 段标记', () => {
     const idx2 = prompt.indexOf('【第 2/4 段】')
     expect(idx1).toBeGreaterThanOrEqual(0)
     expect(idx2).toBeGreaterThan(idx1)
+  })
+})
+
+describe('上轮清单按行号覆盖分发（盲批核对根治）', () => {
+  /** 真实 unified diff：hunk 从新文件第 10 行开始，3 行上下文 + 2 新增 + 2 上下文 */
+  const realPatch = [
+    '@@ -7,7 +7,7 @@ fn main() {',
+    ' ctx line 7',
+    ' ctx line 8',
+    ' ctx line 9',
+    '+added line 10',
+    '+added line 11',
+    ' ctx line 12',
+    ' ctx line 13',
+    '-removed old 14',
+    ' ctx line 14',
+  ].join('\n')
+
+  it('patch 行号解析：单段区间由 hunk 头锚定（上下文 7-9 + 新增 10-11 + 上下文 12-14）', () => {
+    const plan = buildBatchPlan(makePr([makeFile(realPatch)]), 'budget')
+    const coverage = buildBatchCoverage(plan)
+    // 上下文行同样占用新行号：hunk +7 起 → ctx 7,8,9 → +10,11 → ctx 12,13,14 → [7,14]
+    expect(coverage[0].ranges.get('src/a.ts')).toEqual([[7, 14]])
+  })
+
+  it('空上下文行（平台裁剪前导空格）：占行号推进游标，其后行号不错位', () => {
+    // 部分平台把空上下文行输出为空串（无前缀空格）：它占用新行号却不带前缀。
+    // hunk +3 起 → ctx 3 → 空串 ctx（=第 4 行）→ +5 → 若空串不推进游标，
+    // 新增行会被错算成 4（实际是 5），其后全部偏移
+    const patch = ['@@ -3,3 +3,3 @@', ' ctx line 3', '', '+added line 5'].join('\n')
+    const plan = buildBatchPlan(makePr([makeFile(patch)]), 'budget')
+    const coverage = buildBatchCoverage(plan)
+    // 空串行本身也算覆盖（=新文件第 4 行），区间 [3,5]
+    expect(coverage[0].ranges.get('src/a.ts')).toEqual([[3, 5]])
+  })
+
+  it('patch 尾部换行产生的尾部空串伪行：不计入行号（非真实上下文行）', () => {
+    // patch 以 \n 结尾时 split 产出的尾部空串是 split 伪影，不是 diff 行——
+    // 若误当上下文行，末行行号会虚增 1，区间终点错位
+    const patch = '@@ -1,2 +1,2 @@\n ctx line 1\n+added line 2\n'
+    const plan = buildBatchPlan(makePr([makeFile(patch)]), 'budget')
+    const coverage = buildBatchCoverage(plan)
+    expect(coverage[0].ranges.get('src/a.ts')).toEqual([[1, 2]])
+  })
+
+  it('块边界落在 hunk 中间时跨段行号连续（整 patch 预扫描语义）', () => {
+    // 每行恰 1000 字符 × 12 行 = 12000 字符：8KB 边界落在第 8/9 行之间，确定性切成 2 块
+    const patch = [
+      '@@ -1,12 +1,12 @@',
+      ...Array.from({ length: 12 }, () => ` ${'a'.repeat(999)}`),
+    ].join('\n')
+    const plan = buildBatchPlan(makePr([makeFile(patch)]), 'budget')
+    const coverage = buildBatchCoverage(plan)
+    const ranges = coverage.flatMap((c) => c.ranges.get('src/a.ts') ?? [])
+    // 两段区间拼起来必须无缺口：第 1 段终点 +1 = 第 2 段起点（游标跨块连续）
+    expect(ranges).toHaveLength(2)
+    expect(ranges[0][0]).toBe(1)
+    expect(ranges[0][1] + 1).toBe(ranges[1][0])
+    expect(ranges[1][1]).toBe(12)
+  })
+
+  it('超长行被硬切跨块：行区间重叠判定使每一段都计入该行覆盖', () => {
+    // 30KB 超长单行（如 minified 代码）：行对齐失败被硬切成多块，
+    // 行首偏移只在第一块区间内——若按「行首落段」归属，后续块覆盖为空，
+    // 恰好复现盲批核对（该行问题不分发、该批结论无证据）
+    const patch = `@@ -1,1 +1,1 @@\n+${'a'.repeat(30000)}`
+    const plan = buildBatchPlan(makePr([makeFile(patch)]), 'budget')
+    // 30KB patch 切 4 块（8KB/块），按 20KB 批预算装箱为 2 个批次
+    expect(plan.batches.length).toBeGreaterThanOrEqual(2)
+    for (const cov of buildBatchCoverage(plan)) {
+      // 每个持有该超长行片段的块各自记一个 [1,1] 区间（同批多块多区间合法，判定按 some 命中）；
+      // 仅首个只含 hunk 头且未沾到行内容的块可为空
+      const ranges = cov.ranges.get('src/a.ts')
+      expect(ranges).toBeDefined()
+      for (const [from, to] of ranges ?? []) {
+        expect(from).toBe(1)
+        expect(to).toBe(1)
+      }
+    }
+  })
+
+  it('分发：问题行号命中区间才发；未命中不发给该批（盲批消失）', () => {
+    const plan = buildBatchPlan(makePr([makeFile(realPatch)]), 'budget')
+    const coverage = buildBatchCoverage(plan)[0]
+    const issues: AiIssue[] = [
+      { file: 'src/a.ts', line: 11, severity: 'high', type: 'bug', comment: '命中：段内新增行' },
+      { file: 'src/a.ts', line: 500, severity: 'low', type: 'style', comment: '未命中：文件其他位置' },
+    ]
+    const dispatched = previousIssuesForBatch(issues, coverage)
+    expect(dispatched).toHaveLength(1)
+    expect(dispatched[0].line).toBe(11)
+  })
+
+  it('分发规则②③：line=0 文件级问题与无覆盖信息文件（空数组）整文件分发', () => {
+    const plan = buildBatchPlan(
+      makePr([makeFile(realPatch), makeFile('-deleted line\n', 'src/del.ts')]),
+      'budget',
+    )
+    const coverage = buildBatchCoverage(plan)[0]
+    // 纯删除文件：只有删除行（-前缀），不占用新行号 → 键存在、空数组
+    expect(coverage.ranges.get('src/del.ts')).toEqual([])
+    const issues: AiIssue[] = [
+      { file: 'src/del.ts', line: 3, severity: 'medium', type: 'bug', comment: '删除文件内的问题' },
+      { file: 'src/a.ts', line: 0, severity: 'high', type: 'bug', comment: '文件级结论' },
+    ]
+    const dispatched = previousIssuesForBatch(issues, coverage)
+    expect(dispatched).toHaveLength(2)
+  })
+
+  it('分发规则④：文件不在该批则不分发', () => {
+    const plan = buildBatchPlan(makePr([makeFile(realPatch, 'src/a.ts')]), 'budget')
+    const coverage = buildBatchCoverage(plan)[0]
+    const issues: AiIssue[] = [
+      { file: 'src/other.ts', line: 1, severity: 'high', type: 'bug', comment: '别家文件' },
+    ]
+    expect(previousIssuesForBatch(issues, coverage)).toHaveLength(0)
   })
 })
 

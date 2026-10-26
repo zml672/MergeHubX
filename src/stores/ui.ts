@@ -46,6 +46,23 @@ export const useUiStore = defineStore('ui', () => {
     disposeStartupUpdate()
   }
 
+  /** updater 插件检查的在飞共享（评审四轮：启动静默检查与设置页手动检查之间无互斥，
+   *  启动延时窗口内进「关于」页会并发两次 check()）。两处调用经 runExclusiveUpdaterCheck
+   *  等待同一 Promise：在飞直接复用，结束后置空允许下一次检查。失败也清空（下次可重试）；
+   *  catch 后 rethrow 交各调用方按自己的口径处理（启动静默吞、设置页提示） */
+  let updaterCheckInFlight: Promise<Update | null> | null = null
+  function runExclusiveUpdaterCheck(
+    check: () => Promise<Update | null>,
+  ): Promise<Update | null> {
+    if (updaterCheckInFlight) return updaterCheckInFlight
+    // 错误由 Promise 默认传播（调用方各自 catch：启动静默吞、设置页提示）；
+    // 此处只负责在结束时清空在飞槽位（失败也清，下次可重试）
+    updaterCheckInFlight = check().finally(() => {
+      updaterCheckInFlight = null
+    })
+    return updaterCheckInFlight
+  }
+
   return {
     settingsOpen,
     settingsTab,
@@ -54,5 +71,6 @@ export const useUiStore = defineStore('ui', () => {
     closeSettings,
     disposeStartupUpdate,
     dismissStartupUpdate,
+    runExclusiveUpdaterCheck,
   }
 })
